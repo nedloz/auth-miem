@@ -1,24 +1,16 @@
 from fastapi import FastAPI
-from app.api.routes import auth, users
-from app.db.session import engine
-from app.db.base import Base
-
-# Ensure models are imported so metadata is populated
-from app import models  # noqa: F401
+from app.routers import auth
+# from app.routers import profile # Раскомментируй когда напишешь профиль
 
 app = FastAPI(
-    title="Auth Microservice",
-    version="0.2.0",
+    title="Auth Service",
+    description="Микросервис авторизации (REST API)",
+    version="1.0.0"
 )
 
-@app.on_event("startup")
-async def on_startup():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+app.include_router(auth.router, prefix="/api/v1/auth", tags=["Auth"])
+# app.include_router(profile.router, prefix="/api/v1/users", tags=["Profile"])
 
-@app.get("/", summary="Health check")
-async def health():
+@app.get("/health")
+async def health_check():
     return {"status": "ok"}
-
-app.include_router(auth.router, prefix="/auth", tags=["auth"])
-app.include_router(users.router, prefix="/users", tags=["users"])
