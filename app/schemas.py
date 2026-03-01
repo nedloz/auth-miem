@@ -16,6 +16,21 @@ class UserProfileUpdate(BaseModel):
     year: Optional[int] = None
     group_name: Optional[str] = None
 
+class UserProfileRead(BaseModel):
+    user_id: UUID4
+    first_name: Optional[str]
+    last_name: Optional[str]
+    telegram_username: Optional[str]
+    university_id: Optional[UUID4]
+    campus_id: Optional[UUID4]
+    faculty_id: Optional[UUID4]
+    program_id: Optional[UUID4]
+    year: Optional[int]
+    group_name: Optional[str]
+
+    class Config:
+        from_attributes = True
+
 class UserRead(BaseModel):
     id: UUID4
     email: str
