@@ -69,3 +69,15 @@ class RefreshToken(Base):
     ip_address = Column(INET, nullable=True)
     user_agent = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+class PasswordReset(Base):
+    __tablename__ = "password_resets"
+    __table_args__ = {"schema": "auth"}
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("auth.users.id", ondelete="CASCADE"), nullable=False)
+    token_hash = Column(String, unique=True, nullable=False)
+    used_at = Column(DateTime(timezone=True), nullable=True)
+    requested_ip = Column(INET, nullable=True)
+    requested_user_agent = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
