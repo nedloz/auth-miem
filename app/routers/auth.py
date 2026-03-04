@@ -19,25 +19,45 @@ def hash_token(token: str) -> str:
 # -------------------------------------------------------------------
 # 1. REGISTER
 # -------------------------------------------------------------------
+
 @router.post("/register", response_model=UserRead, status_code=status.HTTP_201_CREATED)
 async def register_user(user_in: UserCreate, db: AsyncSession = Depends(get_db)):
-    # Проверка, существует ли юзер
     stmt = select(User).where(User.email == user_in.email)
     result = await db.execute(stmt)
-    if result.scalars().first():
-        raise HTTPException(status_code=400, detail="Email already registered")
+    existing_user = result.scalars().first()
 
-    # Создание пользователя
+    # СЦЕНАРИЙ А: Email уже есть в базе
+    if existing_user:
+        if existing_user.is_email_verified:
+            # Аккаунт уже полностью рабочий, регаться нельзя
+            raise HTTPException(status_code=400, detail="Email already registered")
+        else:
+            # Аккаунт завис (не подтвержден). 
+            # Обновляем ему пароль и просто шлем новый токен.
+            existing_user.password_hash = get_password_hash(user_in.password)
+            
+            raw_verify_token = secrets.token_urlsafe(32)
+            verify_record = EmailVerification(
+                user_id=existing_user.id,
+                email=existing_user.email,
+                token_hash=hash_token(raw_verify_token)
+            )
+            db.add(verify_record)
+            await db.commit()
+            await db.refresh(existing_user)
+
+            print(f"DEBUG EMAIL LINK (RESENT VIA REGISTER): /verify-email?token={raw_verify_token}")
+            return existing_user
+
+    # СЦЕНАРИЙ Б: Полностью новый юзер
     hashed_pwd = get_password_hash(user_in.password)
     new_user = User(email=user_in.email, password_hash=hashed_pwd)
     db.add(new_user)
     await db.flush() # Получаем new_user.id
 
-    # Создание пустого профиля
     new_profile = UserProfile(user_id=new_user.id)
     db.add(new_profile)
 
-    # Генерация токена для почты
     raw_verify_token = secrets.token_urlsafe(32)
     verify_record = EmailVerification(
         user_id=new_user.id,
@@ -49,11 +69,39 @@ async def register_user(user_in: UserCreate, db: AsyncSession = Depends(get_db))
     await db.commit()
     await db.refresh(new_user)
 
-    # TODO: Отправить письмо на почту со ссылкой
     print(f"DEBUG EMAIL LINK: /verify-email?token={raw_verify_token}")
-
     return new_user
 
+# -------------------------------------------------------------------
+# 2.5. RESEND VERIFICATION EMAIL
+# -------------------------------------------------------------------
+@router.post("/resend-verification", status_code=status.HTTP_200_OK)
+async def resend_verification(
+    data: ResendVerification, # Эту схему нужно импортировать из app.schemas!
+    db: AsyncSession = Depends(get_db)
+):
+    stmt = select(User).where(User.email == data.email)
+    result = await db.execute(stmt)
+    user = result.scalars().first()
+
+    # Возвращаем 200 OK даже если юзера нет или он верифицирован, 
+    # чтобы хакеры не могли перебирать email-ы через эту ручку (безопасность!)
+    if not user or user.is_email_verified:
+        return {"detail": "If the account exists and is unverified, a new link has been sent."}
+
+    # Генерируем новый токен
+    raw_verify_token = secrets.token_urlsafe(32)
+    verify_record = EmailVerification(
+        user_id=user.id,
+        email=user.email,
+        token_hash=hash_token(raw_verify_token)
+    )
+    db.add(verify_record)
+    await db.commit()
+
+    print(f"DEBUG EMAIL LINK (RESEND ROUTE): /verify-email?token={raw_verify_token}")
+
+    return {"detail": "If the account exists and is unverified, a new link has been sent."}
 # -------------------------------------------------------------------
 # 2. VERIFY EMAIL
 # -------------------------------------------------------------------
