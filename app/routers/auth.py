@@ -7,7 +7,7 @@ from sqlalchemy.future import select
 
 from app.database import get_db
 from app.models import User, UserProfile, EmailVerification, RefreshToken, PasswordReset
-from app.schemas import UserCreate, UserRead, UserLogin, Token, ForgotPassword, ResetPassword
+from app.schemas import UserCreate, UserRead, UserLogin, Token, ForgotPassword, ResetPassword, ResendVerification
 from app.security import get_password_hash, verify_password, create_access_token, get_current_user
 
 router = APIRouter()
