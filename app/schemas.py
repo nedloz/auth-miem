@@ -55,3 +55,6 @@ class ForgotPassword(BaseModel):
 class ResetPassword(BaseModel):
     token: str
     new_password: str
+
+class ResendVerification(BaseModel):
+    email: EmailStr
