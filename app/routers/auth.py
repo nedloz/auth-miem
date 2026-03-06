@@ -8,7 +8,7 @@ from sqlalchemy.future import select
 from app.database import get_db
 from app.models import User, UserProfile, EmailVerification, RefreshToken, PasswordReset
 from app.schemas import UserCreate, UserRead, UserLogin, Token, ForgotPassword, ResetPassword, ResendVerification
-from app.security import get_password_hash, verify_password, create_access_token, get_current_user
+from app.security import get_password_hash, verify_password, create_access_token, get_current_user, get_user_from_token
 
 router = APIRouter()
 
@@ -253,14 +253,15 @@ async def logout(
 
     response.delete_cookie(key="refresh_token")
     return {"detail": "Successfully logged out"}
-
+    
 # -------------------------------------------------------------------
 # 6. VALIDATE (For NGINX)
 # -------------------------------------------------------------------
 @router.get("/validate", status_code=status.HTTP_200_OK)
 async def validate_token_for_nginx(
     response: Response,
-    current_user: User = Depends(get_current_user)
+    # ВНИМАНИЕ: Здесь используем get_user_from_token!
+    current_user: User = Depends(get_user_from_token) 
 ):
     response.headers["X-User-Id"] = str(current_user.id)
     response.headers["X-User-Role"] = current_user.role
