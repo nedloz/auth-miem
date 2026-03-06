@@ -66,6 +66,7 @@ class RefreshToken(Base):
     user_id = Column(UUID(as_uuid=True), ForeignKey("auth.users.id", ondelete="CASCADE"), nullable=False)
     token_hash = Column(String, unique=True, nullable=False)
     revoked_at = Column(DateTime(timezone=True), nullable=True)
+    replaced_by_token_id = Column(UUID(as_uuid=True), ForeignKey("auth.refresh_tokens.id", ondelete="SET NULL"), nullable=True)
     ip_address = Column(INET, nullable=True)
     user_agent = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
