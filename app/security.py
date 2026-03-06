@@ -1,7 +1,7 @@
 import os
 from datetime import datetime, timedelta, timezone
 import bcrypt
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, status, Header
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -35,7 +35,11 @@ def create_access_token(data: dict):
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-async def get_current_user(
+# =====================================================================
+# 1. ЭТУ ФУНКЦИЮ ИСПОЛЬЗУЕТ ТОЛЬКО NGINX (роут /validate)
+# Она честно проверяет JWT-токен.
+# =====================================================================
+async def get_user_from_token(
     token: str = Depends(oauth2_scheme), 
     db: AsyncSession = Depends(get_db)
 ):
@@ -56,9 +60,32 @@ async def get_current_user(
     result = await db.execute(stmt)
     user = result.scalars().first()
     
-    if user is None:
+    if user is None or not user.is_active:
         raise credentials_exception
-    if not user.is_active:
-        raise HTTPException(status_code=400, detail="Inactive user")
+        
+    return user
+
+# =====================================================================
+# 2. ЭТУ ФУНКЦИЮ ИСПОЛЬЗУЮТ ВСЕ ВНУТРЕННИЕ РОУТЫ (например, профиль)
+# Она просто читает заголовок X-User-Id, который прокинул Nginx.
+# =====================================================================
+async def get_current_user(
+    x_user_id: str = Header(None, alias="X-User-Id"),
+    db: AsyncSession = Depends(get_db)
+):
+    # Если заголовка нет — значит запрос пришел в обход Nginx или юзер не авторизован
+    if not x_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing X-User-Id header. Unauthorized."
+        )
+        
+    # Просто достаем юзера из базы (чтобы роуты профиля могли с ним работать)
+    stmt = select(User).where(User.id == x_user_id)
+    result = await db.execute(stmt)
+    user = result.scalars().first()
+    
+    if user is None or not user.is_active:
+        raise HTTPException(status_code=401, detail="User not found or inactive")
         
     return user
