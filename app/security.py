@@ -40,14 +40,20 @@ def create_access_token(data: dict):
 # Она честно проверяет JWT-токен.
 # =====================================================================
 async def get_user_from_token(
-    token: str = Depends(oauth2_scheme), 
-    db: AsyncSession = Depends(get_db)
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    db: AsyncSession = Depends(get_db),
 ):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
+
+    if not authorization or not authorization.startswith("Bearer "):
+        raise credentials_exception
+
+    token = authorization.removeprefix("Bearer ").strip()
+
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id: str = payload.get("sub")
@@ -55,14 +61,14 @@ async def get_user_from_token(
             raise credentials_exception
     except (jwt.PyJWTError, ValidationError):
         raise credentials_exception
-        
+
     stmt = select(User).where(User.id == user_id)
     result = await db.execute(stmt)
     user = result.scalars().first()
-    
+
     if user is None or not user.is_active:
         raise credentials_exception
-        
+
     return user
 
 # =====================================================================

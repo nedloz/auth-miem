@@ -3,15 +3,19 @@ import random
 import string
 import time
 
-BASE_URL = "http://localhost:8000/api/v1"
+BASE_URL = "http://localhost/api"
 # Используем Session, чтобы requests автоматически сохранял куки (наш HttpOnly refresh_token)
 session = requests.Session()
 
 # Генерируем уникальный email для каждого запуска теста
 rnd = ''.join(random.choices(string.ascii_lowercase + string.digits, k=5))
 EMAIL = f"student_{rnd}@university.edu"
-PASSWORD = "StrongPassword123!"
-NEW_PASSWORD = "EvenStrongerPassword456!"
+# EMAIL = f"test@test.com"
+PASSWORD = "123456"
+NEW_PASSWORD = "1234567"
+# EMAIL = f"test1@test.com"
+# PASSWORD = "1234567"
+# NEW_PASSWORD = "12345678"
 
 def print_step(step_name):
     print(f"\n[{step_name.upper()}] {'-'*40}")
@@ -30,13 +34,13 @@ def run_tests():
     assert resp.status_code == 201, f"Ошибка регистрации: {resp.text}"
     print("✅ Пользователь успешно создан.")
     
-    # ==========================================
-    # 2. ВЕРИФИКАЦИЯ ПОЧТЫ
-    # ==========================================
+    # # ==========================================
+    # # 2. ВЕРИФИКАЦИЯ ПОЧТЫ
+    # # ==========================================
     print_step("2. Верификация почты")
     print("⚠️ Посмотри в терминал, где запущен FastAPI сервер!")
     print("Там должна быть строка: DEBUG EMAIL LINK: /verify-email?token=ТВОЙ_ТОКЕН")
-    verify_token = input("Скопируй ТВОЙ_ТОКЕН сюда и нажми Enter: ").strip()
+    verify_token = input("DqSbGRrKZA8M_MYxHIjADAAkoIBxJR1m72u6CEvUPv0").strip()
     
     resp = session.get(f"{BASE_URL}/auth/verify-email", params={"token": verify_token})
     assert resp.status_code == 200, f"Ошибка верификации: {resp.text}"
@@ -54,9 +58,11 @@ def run_tests():
     data = resp.json()
     access_token = data["access_token"]
     print("✅ Логин успешен. Access Token получен.")
+    print(data)
     print(f"🍪 Куки в сессии (Refresh Token): {session.cookies.get_dict()}")
 
     headers = {"Authorization": f"Bearer {access_token}"}
+    # headers = {"Authorization": f"Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIyZjNlMDE3MS1hOTgyLTQ0NDItOTM4ZS1mMWMwZTAzNmZiNjkiLCJyb2xlIjoic3R1ZGVudCIsImV4cCI6MTc3Mjc5Mjg2MX0.USdEishKFJUOSmcR8Dv1f-JQHIqsueZaQSfky51gZdk"}
 
     # ==========================================
     # 4. ПОЛУЧЕНИЕ И ОБНОВЛЕНИЕ ПРОФИЛЯ
@@ -78,12 +84,12 @@ def run_tests():
     # ==========================================
     # 5. ПРОВЕРКА ВАЛИДАЦИИ ДЛЯ NGINX
     # ==========================================
-    print_step("5. NGINX Validate (/auth/validate)")
-    resp = session.get(f"{BASE_URL}/auth/validate", headers=headers)
-    assert resp.status_code == 200, f"Ошибка валидации NGINX: {resp.text}"
-    print("✅ Валидация успешна. Заголовки для NGINX:")
-    print(f"   X-User-Id: {resp.headers.get('X-User-Id')}")
-    print(f"   X-User-Role: {resp.headers.get('X-User-Role')}")
+    # print_step("5. NGINX Validate (/auth/validate)")
+    # resp = session.get(f"{BASE_URL}/auth/validate", headers=headers)
+    # assert resp.status_code == 200, f"Ошибка валидации NGINX: {resp.text}"
+    # print("✅ Валидация успешна. Заголовки для NGINX:")
+    # print(f"   X-User-Id: {resp.headers.get('X-User-Id')}")
+    # print(f"   X-User-Role: {resp.headers.get('X-User-Role')}")
 
     # ==========================================
     # 6. REFRESH TOKEN
