@@ -1,3 +1,5 @@
+import json
+import logging
 import os
 from datetime import datetime, timedelta, timezone
 import bcrypt
@@ -10,9 +12,70 @@ from app.database import get_db
 from app.models import User
 import jwt
 
+logger = logging.getLogger(__name__)
+
 SECRET_KEY = os.getenv("SECRET_KEY", "dev_secret")
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "15"))
+INTERNAL_AUTH_HEADER_NAME = os.getenv("INTERNAL_AUTH_HEADER_NAME", "X-Service-Token")
+INTERNAL_SERVICE_NAME_HEADER = os.getenv("INTERNAL_SERVICE_NAME_HEADER", "X-Service-Name")
+
+
+def _load_trusted_service_tokens() -> dict[str, str]:
+    raw_value = os.getenv("TRUSTED_SERVICE_TOKENS", "{}")
+
+    try:
+        parsed = json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Invalid TRUSTED_SERVICE_TOKENS env value. Expected JSON object.") from exc
+
+    if not isinstance(parsed, dict):
+        raise RuntimeError("TRUSTED_SERVICE_TOKENS must be a JSON object.")
+
+    normalized: dict[str, str] = {}
+    for service_name, token in parsed.items():
+        if service_name is None or token is None:
+            continue
+        normalized[str(service_name)] = str(token)
+
+    return normalized
+
+
+def _extract_internal_header_value(headers: dict[str, str], header_name: str) -> str | None:
+    return headers.get(header_name.lower())
+
+
+async def verify_internal_service_request(
+    x_service_name: str | None = Header(default=None, alias="X-Service-Name"),
+    x_service_token: str | None = Header(default=None, alias="X-Service-Token"),
+):
+    header_values = {
+        INTERNAL_SERVICE_NAME_HEADER.lower(): x_service_name,
+        INTERNAL_AUTH_HEADER_NAME.lower(): x_service_token,
+    }
+
+    service_name = _extract_internal_header_value(header_values, INTERNAL_SERVICE_NAME_HEADER)
+    service_token = _extract_internal_header_value(header_values, INTERNAL_AUTH_HEADER_NAME)
+
+    if not service_name or not service_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing internal auth headers",
+        )
+
+    trusted_service_tokens = _load_trusted_service_tokens()
+    expected_token = trusted_service_tokens.get(service_name)
+
+    if expected_token is None or expected_token != service_token:
+        logger.warning("Internal API forbidden for service=%s", service_name)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden internal service",
+        )
+
+    logger.info("Internal API authorized for service=%s", service_name)
+    return service_name
+
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     password_bytes = plain_password.encode('utf-8')
