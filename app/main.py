@@ -6,6 +6,7 @@ from sqlalchemy import text
 # Импортируем роутеры и движок БД
 from app.routers import auth
 from app.routers import profile
+from app.routers import internal
 from app.database import engine
 
 # Настраиваем красивый вывод логов в консоль
@@ -47,6 +48,7 @@ app = FastAPI(
 # Подключаем наши роуты
 app.include_router(auth.router, prefix="/auth", tags=["Auth"])
 app.include_router(profile.router, prefix="/users", tags=["Profile"])
+app.include_router(internal.router, prefix="/internal", tags=["Internal"])
 
 # Эндпоинт для проверки жизнеспособности (Health Check)
 @app.get("/health", tags=["System"])

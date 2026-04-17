@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr, UUID4
-from typing import Optional
+from typing import Optional, Any
 from datetime import datetime
 
 class UserCreate(BaseModel):
@@ -58,3 +58,23 @@ class ResetPassword(BaseModel):
 
 class ResendVerification(BaseModel):
     email: EmailStr
+
+
+class InternalUserProfilePayload(BaseModel):
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    telegram_username: Optional[str] = None
+    university_id: Optional[UUID4] = None
+    campus_id: Optional[UUID4] = None
+    faculty_id: Optional[UUID4] = None
+    program_id: Optional[UUID4] = None
+    year: Optional[int] = None
+    group_name: Optional[str] = None
+    preferences: dict[str, Any] = {}
+
+
+class InternalUserProfileResponse(BaseModel):
+    id: UUID4
+    email: Optional[str] = None
+    role: Optional[str] = None
+    profile: InternalUserProfilePayload
