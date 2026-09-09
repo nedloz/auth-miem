@@ -25,7 +25,10 @@ async def get_my_profile(
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
 
-    return profile
+    # Роль хранится в users, а не в user_profiles, поэтому подставляем её отдельно.
+    payload = UserProfileRead.model_validate(profile)
+    payload.role = current_user.role
+    return payload
 
 
 @router.patch("/me", response_model=UserProfileRead)
@@ -53,7 +56,11 @@ async def update_my_profile(
     await db.commit()
     await db.refresh(profile)
 
-    return profile
+    # Роль подставляем и здесь: фронтенд кладёт ответ PATCH в то же состояние, что и ответ
+    # GET, и без неё после сохранения профиля пропала бы кнопка входа в админку.
+    payload = UserProfileRead.model_validate(profile)
+    payload.role = current_user.role
+    return payload
 
 
 @router.delete("/me", status_code=status.HTTP_204_NO_CONTENT)

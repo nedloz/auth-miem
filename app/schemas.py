@@ -27,6 +27,9 @@ class UserProfileRead(BaseModel):
     program_id: Optional[UUID4]
     year: Optional[int]
     group_name: Optional[str]
+    # Роль лежит не в профиле, а в самой учётной записи, но фронтенду нужна именно здесь:
+    # по ней решается, показывать ли вход в админ-панель. Заполняется в обработчике.
+    role: Optional[str] = None
 
     class Config:
         from_attributes = True
