@@ -8,7 +8,19 @@ from sqlalchemy.future import select
 from app.database import get_db
 from app.models import User, UserProfile, EmailVerification, RefreshToken, PasswordReset
 from app.schemas import UserCreate, UserRead, UserLogin, Token, ForgotPassword, ResetPassword, ResendVerification
-from app.security import get_password_hash, verify_password, create_access_token, get_current_user, get_user_from_token
+from app.security import (
+    ADMIN_SESSION_COOKIE_NAME,
+    ADMIN_SESSION_COOKIE_PATH,
+    ADMIN_SESSION_COOKIE_SECURE,
+    ADMIN_SESSION_EXPIRE_MINUTES,
+    create_access_token,
+    create_admin_session_token,
+    get_admin_from_cookie,
+    get_current_user,
+    get_password_hash,
+    get_user_from_token,
+    verify_password,
+)
 
 router = APIRouter()
 
@@ -263,6 +275,59 @@ async def validate_token_for_nginx(
     # ВНИМАНИЕ: Здесь используем get_user_from_token!
     current_user: User = Depends(get_user_from_token) 
 ):
+    response.headers["X-User-Id"] = str(current_user.id)
+    response.headers["X-User-Role"] = current_user.role
+    return {"status": "valid"}
+
+# -------------------------------------------------------------------
+# 6b. АДМИН-СЕССИЯ (вход в панель db-svc за /admin/)
+# -------------------------------------------------------------------
+@router.post("/admin-session", status_code=status.HTTP_200_OK)
+async def open_admin_session(response: Response, current_user: User = Depends(get_current_user)):
+    """Выдаёт короткоживущую HttpOnly-куку для входа в админ-панель.
+
+    Вызывается фронтендом по нажатию кнопки «Админка». Сам пользователь определяется по
+    заголовку X-User-Id, который проставил nginx после проверки JWT, — то есть в этот роут
+    нельзя попасть, не имея валидного access-токена.
+
+    Зачем кука, а не заголовок: переход в панель — обычная навигация браузера, в ней нет
+    Authorization. Кука уходит и с навигацией, и со всеми подзапросами админки.
+    """
+    if current_user.role != "admin":
+        # 404, а не 403: не подтверждаем существование раздела тем, у кого нет прав.
+        # Это не замена проверке прав, а лишь отсутствие лишнего сигнала.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+
+    response.set_cookie(
+        key=ADMIN_SESSION_COOKIE_NAME,
+        value=create_admin_session_token(current_user),
+        httponly=True,
+        secure=ADMIN_SESSION_COOKIE_SECURE,
+        samesite="lax",
+        # Кука ограничена путём админки: на обычные запросы приложения она не отправляется.
+        path=ADMIN_SESSION_COOKIE_PATH,
+        max_age=ADMIN_SESSION_EXPIRE_MINUTES * 60,
+    )
+    return {"status": "ok", "expires_in": ADMIN_SESSION_EXPIRE_MINUTES * 60, "url": "/admin/"}
+
+
+@router.post("/admin-session/close", status_code=status.HTTP_200_OK)
+async def close_admin_session(response: Response):
+    """Досрочно гасит админ-сессию (выход из панели)."""
+    response.delete_cookie(key=ADMIN_SESSION_COOKIE_NAME, path=ADMIN_SESSION_COOKIE_PATH)
+    return {"status": "ok"}
+
+
+@router.get("/validate-admin", status_code=status.HTTP_200_OK)
+async def validate_admin_for_nginx(
+    response: Response,
+    current_user: User = Depends(get_admin_from_cookie),
+):
+    """auth_request-эндпоинт для nginx перед проксированием в db-svc.
+
+    Возвращает 200 только обладателю действующей админ-сессии; всем остальным — 403, и тогда
+    nginx не обращается к db-svc вовсе, то есть страницы админки не покидают контур.
+    """
     response.headers["X-User-Id"] = str(current_user.id)
     response.headers["X-User-Role"] = current_user.role
     return {"status": "valid"}
