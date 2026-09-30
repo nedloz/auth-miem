@@ -5,36 +5,104 @@ import redis.asyncio as redis
 from app.config import settings
 
 
-# Один Redis-клиент на процесс auth-svc.
+# Единый Redis client для auth-svc.
 #
-# Используем тот же Redis, который уже существует
-# в pochemuchnic-miem-prj.
+# Сами auth-токены сюда НЕ записываются.
+#
+# Redis используется только для временных cooldown/rate-limit
+# ключей отправки email.
 redis_client = redis.from_url(
     settings.REDIS_URL,
     decode_responses=True,
 )
 
 
-def _hash_value(value: str) -> str:
+def _hash_email(email: str) -> str:
     """
-    Не кладём email в Redis key в открытом виде.
-
-    Например:
-    user@example.com
-        ↓
-    SHA-256
-        ↓
-    auth:email-cooldown:verify:<hash>
+    Не помещаем email в Redis key открытым текстом.
     """
 
-    normalized = value.strip().casefold()
+    normalized_email = email.strip().casefold()
 
     return hashlib.sha256(
-        normalized.encode("utf-8")
+        normalized_email.encode("utf-8")
     ).hexdigest()
 
 
 def make_email_cooldown_key(
+    purpose: str,
+    email: str,
+) -> str:
+    """
+    Redis keys:
+
+        auth:email-cooldown:verify:<hash>
+        auth:email-cooldown:reset:<hash>
+    """
+
+    return (
+        "auth:email-cooldown:"
+        f"{purpose}:"
+        f"{_hash_email(email)}"
+    )
+
+
+async def acquire_email_cooldown(
+    purpose: str,
+    email: str,
+) -> tuple[bool, str]:
+    """
+    Пытаемся создать cooldown key.
+
+    NX:
+        создать ключ только если его ещё нет.
+
+    EX:
+        автоматически удалить через N секунд.
+
+    Возвращает:
+
+        (True, key)
+            письмо можно отправлять.
+
+        (False, key)
+            cooldown уже существует.
+    """
+
+    key = make_email_cooldown_key(
+        purpose,
+        email,
+    )
+
+    acquired = await redis_client.set(
+        key,
+        "1",
+        nx=True,
+        ex=settings.EMAIL_SEND_COOLDOWN_SECONDS,
+    )
+
+    return bool(acquired), key
+
+
+async def release_email_cooldown(
+    key: str,
+) -> None:
+    """
+    Если SMTP-отправка завершилась ошибкой,
+    удаляем cooldown, чтобы пользователь
+    мог попробовать отправить письмо ещё раз.
+    """
+
+    await redis_client.delete(key)
+
+
+async def close_redis() -> None:
+    """
+    Закрываем Redis connection pool
+    при завершении auth-svc.
+    """
+
+    await redis_client.aclose()def make_email_cooldown_key(
     purpose: str,
     email: str,
 ) -> str:
