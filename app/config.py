@@ -3,16 +3,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     """
-    Конфигурация параметров, связанных с:
-    - SMTP;
-    - временем жизни auth-токенов;
-    - Redis;
-    - URL frontend.
+    Дополнительная конфигурация auth-svc.
 
-    DATABASE_URL, SECRET_KEY и остальные существующие
-    настройки проекта здесь специально не дублируются:
-    текущий database.py/security.py продолжают работать
-    как раньше.
+    Существующие DATABASE_URL, SECRET_KEY, ACCESS_TOKEN_EXPIRE_MINUTES
+    и admin-настройки остаются в текущих database.py/security.py.
+
+    Здесь находятся только параметры, которые нужны для нового
+    SMTP/Redis/token-lifetime функционала.
     """
 
     model_config = SettingsConfigDict(
@@ -26,15 +23,50 @@ class Settings(BaseSettings):
     # TOKEN LIFETIMES
     # =========================================================
 
-    # 30 дней
+    # Refresh token: 30 дней
     REFRESH_TOKEN_EXPIRE_MINUTES: int = 43200
 
-    # 24 часа
+    # Email verification token: 24 часа
     EMAIL_VERIFY_TOKEN_EXPIRE_MINUTES: int = 1440
 
-    # 1 час
+    # Password reset token: 1 час
     PASSWORD_RESET_TOKEN_EXPIRE_MINUTES: int = 60
 
+    # =========================================================
+    # FRONTEND
+    # =========================================================
+
+    # Публичный URL frontend/nginx.
+    FRONTEND_BASE_URL: str = "http://localhost"
+
+    # =========================================================
+    # SMTP
+    # =========================================================
+
+    SMTP_HOST: str = "smtp.gmail.com"
+    SMTP_PORT: int = 587
+
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+
+    SMTP_USE_TLS: bool = True
+    SMTP_USE_SSL: bool = False
+
+    EMAIL_FROM: str = ""
+
+    # =========================================================
+    # REDIS
+    # =========================================================
+
+    # В основном docker-compose это значение уже
+    # прокидывается через environment.
+    REDIS_URL: str = "redis://redis:6379/0"
+
+    # Кэш профилей.
+    PROFILE_CACHE_TTL_SECONDS: int = 300
+
+
+settings = Settings()
     # =========================================================
     # FRONTEND
     # =========================================================
