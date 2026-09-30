@@ -1,18 +1,18 @@
-from functools import lru_cache
-
-from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     """
-    Единая конфигурация auth-svc.
+    Конфигурация параметров, связанных с:
+    - SMTP;
+    - временем жизни auth-токенов;
+    - Redis;
+    - URL frontend.
 
-    Зачем:
-    - убираем os.getenv() из разных файлов;
-    - TTL токенов задаются только через ENV;
-    - SMTP и Redis тоже настраиваются через ENV;
-    - compose/.env становится единственным источником конфигурации.
+    DATABASE_URL, SECRET_KEY и остальные существующие
+    настройки проекта здесь специально не дублируются:
+    текущий database.py/security.py продолжают работать
+    как раньше.
     """
 
     model_config = SettingsConfigDict(
@@ -23,41 +23,34 @@ class Settings(BaseSettings):
     )
 
     # =========================================================
-    # DATABASE
-    # =========================================================
-
-    DATABASE_URL: str
-
-    # =========================================================
-    # JWT
-    # =========================================================
-
-    SECRET_KEY: str
-    ALGORITHM: str = "HS256"
-
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
-
-    # =========================================================
     # TOKEN LIFETIMES
     # =========================================================
 
+    # 30 дней
     REFRESH_TOKEN_EXPIRE_MINUTES: int = 43200
 
+    # 24 часа
     EMAIL_VERIFY_TOKEN_EXPIRE_MINUTES: int = 1440
 
+    # 1 час
     PASSWORD_RESET_TOKEN_EXPIRE_MINUTES: int = 60
 
     # =========================================================
     # FRONTEND
     # =========================================================
 
+    # Публичный URL frontend.
+    #
+    # В текущем compose по умолчанию nginx слушает localhost:80,
+    # поэтому для локального запуска это:
+    # http://localhost
     FRONTEND_BASE_URL: str = "http://localhost"
 
     # =========================================================
     # SMTP
     # =========================================================
 
-    SMTP_HOST: str = ""
+    SMTP_HOST: str = "smtp.gmail.com"
     SMTP_PORT: int = 587
 
     SMTP_USER: str = ""
@@ -72,47 +65,13 @@ class Settings(BaseSettings):
     # REDIS
     # =========================================================
 
+    # В docker-compose auth-svc уже получает
+    # REDIS_URL=redis://redis:6379/0.
     REDIS_URL: str = "redis://redis:6379/0"
 
-    # Сколько секунд нельзя повторно отправлять
-    # одно и то же verification/reset письмо.
+    # Минимальный интервал между повторной отправкой
+    # verification/reset email.
     EMAIL_SEND_COOLDOWN_SECONDS: int = 60
 
-    # =========================================================
-    # REFRESH COOKIE
-    # =========================================================
 
-    REFRESH_COOKIE_NAME: str = "refresh_token"
-    REFRESH_COOKIE_SECURE: bool = False
-    REFRESH_COOKIE_SAMESITE: str = "lax"
-
-    # =========================================================
-    # ADMIN SESSION
-    # =========================================================
-
-    ADMIN_SESSION_COOKIE_NAME: str = "admin_session"
-    ADMIN_SESSION_EXPIRE_MINUTES: int = 30
-    ADMIN_SESSION_COOKIE_PATH: str = "/admin"
-    ADMIN_SESSION_COOKIE_SECURE: bool = False
-
-    # =========================================================
-    # INTERNAL SERVICE AUTH
-    # =========================================================
-
-    INTERNAL_AUTH_HEADER_NAME: str = "X-Service-Token"
-    INTERNAL_SERVICE_NAME_HEADER: str = "X-Service-Name"
-
-    TRUSTED_SERVICE_TOKENS: dict[str, str] = Field(
-        default_factory=dict
-    )
-
-
-@lru_cache
-def get_settings() -> Settings:
-    """
-    Возвращаем один экземпляр настроек на весь процесс.
-    """
-    return Settings()
-
-
-settings = get_settings()
+settings = Settings()
