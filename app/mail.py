@@ -8,33 +8,292 @@ from app.config import settings
 
 class EmailDeliveryError(RuntimeError):
     """
-    Ошибка отправки письма.
-
-    Выделяем её отдельно, чтобы auth-роуты могли
-    отличать проблемы SMTP от обычных ошибок БД.
+    Ошибка доставки email через SMTP.
     """
 
 
 def _validate_smtp_settings() -> None:
     """
-    Проверяем SMTP-конфигурацию перед отправкой.
+    Проверяем минимально необходимую конфигурацию SMTP.
+
+    Допускаем SMTP без authentication:
+    это удобно для локального Mailpit/MailHog.
+
+    Если указан SMTP_USER, обязательно должен быть
+    указан и SMTP_PASSWORD.
     """
 
-    required = {
-        "SMTP_HOST": settings.SMTP_HOST,
-        "SMTP_USER": settings.SMTP_USER,
-        "SMTP_PASSWORD": settings.SMTP_PASSWORD,
-        "EMAIL_FROM": settings.EMAIL_FROM,
-    }
-
-    missing = [
-        name
-        for name, value in required.items()
-        if not value
-    ]
-
-    if missing:
+    if not settings.SMTP_HOST:
         raise EmailDeliveryError(
+            "SMTP_HOST is not configured"
+        )
+
+    if not settings.EMAIL_FROM:
+        raise EmailDeliveryError(
+            "EMAIL_FROM is not configured"
+        )
+
+    if (
+        settings.SMTP_USE_TLS
+        and settings.SMTP_USE_SSL
+    ):
+        raise EmailDeliveryError(
+            "SMTP_USE_TLS and SMTP_USE_SSL "
+            "cannot both be enabled"
+        )
+
+    if bool(settings.SMTP_USER) != bool(
+        settings.SMTP_PASSWORD
+    ):
+        raise EmailDeliveryError(
+            "SMTP_USER and SMTP_PASSWORD "
+            "must be specified together"
+        )
+
+
+def _send_email_sync(
+    recipient: str,
+    subject: str,
+    text_body: str,
+    html_body: str | None = None,
+) -> None:
+    """
+    Синхронная отправка email через smtplib.
+
+    FastAPI работает асинхронно, поэтому эта функция
+    вызывается через asyncio.to_thread().
+    """
+
+    _validate_smtp_settings()
+
+    message = EmailMessage()
+
+    message["From"] = settings.EMAIL_FROM
+    message["To"] = recipient
+    message["Subject"] = subject
+
+    message.set_content(text_body)
+
+    if html_body:
+        message.add_alternative(
+            html_body,
+            subtype="html",
+        )
+
+    ssl_context = ssl.create_default_context()
+
+    try:
+        # -----------------------------------------------------
+        # SMTPS
+        # -----------------------------------------------------
+
+        if settings.SMTP_USE_SSL:
+            with smtplib.SMTP_SSL(
+                settings.SMTP_HOST,
+                settings.SMTP_PORT,
+                timeout=20,
+                context=ssl_context,
+            ) as smtp:
+
+                if settings.SMTP_USER:
+                    smtp.login(
+                        settings.SMTP_USER,
+                        settings.SMTP_PASSWORD,
+                    )
+
+                smtp.send_message(message)
+
+            return
+
+        # -----------------------------------------------------
+        # SMTP
+        # -----------------------------------------------------
+
+        with smtplib.SMTP(
+            settings.SMTP_HOST,
+            settings.SMTP_PORT,
+            timeout=20,
+        ) as smtp:
+
+            smtp.ehlo()
+
+            if settings.SMTP_USE_TLS:
+                smtp.starttls(
+                    context=ssl_context
+                )
+                smtp.ehlo()
+
+            if settings.SMTP_USER:
+                smtp.login(
+                    settings.SMTP_USER,
+                    settings.SMTP_PASSWORD,
+                )
+
+            smtp.send_message(message)
+
+    except (
+        OSError,
+        smtplib.SMTPException,
+    ) as exc:
+        raise EmailDeliveryError(
+            "Failed to send email"
+        ) from exc
+
+
+async def send_email(
+    recipient: str,
+    subject: str,
+    text_body: str,
+    html_body: str | None = None,
+) -> None:
+    """
+    Асинхронная обёртка над smtplib.
+    """
+
+    await asyncio.to_thread(
+        _send_email_sync,
+        recipient,
+        subject,
+        text_body,
+        html_body,
+    )
+
+
+# =========================================================
+# VERIFICATION EMAIL
+# =========================================================
+
+async def send_verification_email(
+    recipient: str,
+    verification_url: str,
+) -> None:
+    """
+    Отправка письма подтверждения email.
+    """
+
+    subject = "Подтверждение электронной почты"
+
+    text_body = f"""
+Здравствуйте!
+
+Для подтверждения электронной почты перейдите по ссылке:
+
+{verification_url}
+
+Ссылка действует ограниченное время.
+
+Если вы не регистрировались в системе,
+просто проигнорируйте это письмо.
+""".strip()
+
+    html_body = f"""
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Подтверждение электронной почты</title>
+</head>
+
+<body>
+    <h2>Подтверждение электронной почты</h2>
+
+    <p>
+        Для подтверждения электронной почты
+        перейдите по ссылке:
+    </p>
+
+    <p>
+        <a href="{verification_url}">
+            Подтвердить электронную почту
+        </a>
+    </p>
+
+    <p>
+        Ссылка действует ограниченное время.
+    </p>
+
+    <p>
+        Если вы не регистрировались в системе,
+        просто проигнорируйте это письмо.
+    </p>
+</body>
+</html>
+""".strip()
+
+    await send_email(
+        recipient=recipient,
+        subject=subject,
+        text_body=text_body,
+        html_body=html_body,
+    )
+
+
+# =========================================================
+# PASSWORD RESET EMAIL
+# =========================================================
+
+async def send_password_reset_email(
+    recipient: str,
+    reset_url: str,
+) -> None:
+    """
+    Отправка письма для восстановления пароля.
+    """
+
+    subject = "Сброс пароля"
+
+    text_body = f"""
+Здравствуйте!
+
+Для смены пароля перейдите по ссылке:
+
+{reset_url}
+
+Ссылка действует ограниченное время.
+
+Если вы не запрашивали сброс пароля,
+просто проигнорируйте это письмо.
+""".strip()
+
+    html_body = f"""
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Сброс пароля</title>
+</head>
+
+<body>
+    <h2>Сброс пароля</h2>
+
+    <p>
+        Для смены пароля перейдите по ссылке:
+    </p>
+
+    <p>
+        <a href="{reset_url}">
+            Сбросить пароль
+        </a>
+    </p>
+
+    <p>
+        Ссылка действует ограниченное время.
+    </p>
+
+    <p>
+        Если вы не запрашивали сброс пароля,
+        просто проигнорируйте это письмо.
+    </p>
+</body>
+</html>
+""".strip()
+
+    await send_email(
+        recipient=recipient,
+        subject=subject,
+        text_body=text_body,
+        html_body=html_body,
+    )        raise EmailDeliveryError(
             "SMTP is not configured. Missing: "
             + ", ".join(missing)
         )
