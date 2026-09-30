@@ -1,170 +1,236 @@
 import hashlib
+import json
+from uuid import UUID
 
 import redis.asyncio as redis
+from redis.exceptions import RedisError
 
 from app.config import settings
 
 
-# Единый Redis client для auth-svc.
-#
-# Сами auth-токены сюда НЕ записываются.
-#
-# Redis используется только для временных cooldown/rate-limit
-# ключей отправки email.
+# =========================================================
+# REDIS CLIENT
+# =========================================================
+
 redis_client = redis.from_url(
     settings.REDIS_URL,
     decode_responses=True,
 )
 
 
-def _hash_email(email: str) -> str:
-    """
-    Не помещаем email в Redis key открытым текстом.
-    """
+# =========================================================
+# SHORT-LIVED TOKENS
+# =========================================================
 
-    normalized_email = email.strip().casefold()
-
-    return hashlib.sha256(
-        normalized_email.encode("utf-8")
-    ).hexdigest()
-
-
-def make_email_cooldown_key(
-    purpose: str,
-    email: str,
+def _token_key(
+    kind: str,
+    token_hash: str,
 ) -> str:
     """
-    Redis keys:
+    Примеры:
 
-        auth:email-cooldown:verify:<hash>
-        auth:email-cooldown:reset:<hash>
+    auth:token:verify:v1:<sha256>
+    auth:token:reset:v1:<sha256>
     """
 
     return (
-        "auth:email-cooldown:"
-        f"{purpose}:"
-        f"{_hash_email(email)}"
+        f"auth:token:"
+        f"{kind}:v1:"
+        f"{token_hash}"
     )
 
 
-async def acquire_email_cooldown(
-    purpose: str,
-    email: str,
-) -> tuple[bool, str]:
-    """
-    Пытаемся создать cooldown key.
-
-    NX:
-        создать ключ только если его ещё нет.
-
-    EX:
-        автоматически удалить через N секунд.
-
-    Возвращает:
-
-        (True, key)
-            письмо можно отправлять.
-
-        (False, key)
-            cooldown уже существует.
-    """
-
-    key = make_email_cooldown_key(
-        purpose,
-        email,
-    )
-
-    acquired = await redis_client.set(
-        key,
-        "1",
-        nx=True,
-        ex=settings.EMAIL_SEND_COOLDOWN_SECONDS,
-    )
-
-    return bool(acquired), key
-
-
-async def release_email_cooldown(
-    key: str,
+async def cache_one_time_token(
+    kind: str,
+    token_hash: str,
+    user_id: UUID,
+    ttl_seconds: int,
 ) -> None:
     """
-    Если SMTP-отправка завершилась ошибкой,
-    удаляем cooldown, чтобы пользователь
-    мог попробовать отправить письмо ещё раз.
+    Кладём hash одноразового токена в Redis.
+
+    Raw token в Redis не хранится.
+
+    PostgreSQL при этом остаётся источником истины.
     """
 
-    await redis_client.delete(key)
+    try:
+        await redis_client.set(
+            _token_key(
+                kind,
+                token_hash,
+            ),
+            str(user_id),
+            ex=max(1, ttl_seconds),
+        )
+
+    except RedisError:
+        # Redis — дополнительный слой.
+        # Отказ Redis не должен ломать auth.
+        pass
 
 
-async def close_redis() -> None:
+async def get_cached_one_time_token(
+    kind: str,
+    token_hash: str,
+) -> str | None:
     """
-    Закрываем Redis connection pool
-    при завершении auth-svc.
+    Возвращает user_id из Redis,
+    либо None при cache miss/ошибке Redis.
     """
 
-    await redis_client.aclose()def make_email_cooldown_key(
-    purpose: str,
-    email: str,
+    try:
+        return await redis_client.get(
+            _token_key(
+                kind,
+                token_hash,
+            )
+        )
+
+    except RedisError:
+        return None
+
+
+async def delete_cached_one_time_token(
+    kind: str,
+    token_hash: str,
+) -> None:
+    """
+    Удаляет использованный одноразовый токен.
+    """
+
+    try:
+        await redis_client.delete(
+            _token_key(
+                kind,
+                token_hash,
+            )
+        )
+
+    except RedisError:
+        pass
+
+
+# =========================================================
+# PROFILE CACHE
+# =========================================================
+
+def _profile_key(
+    user_id: UUID | str,
+    scope: str,
 ) -> str:
     """
-    Создаёт namespaced Redis key.
+    Scope:
 
-    purpose:
-    - verify
-    - reset
+    me
+        /users/me
+
+    internal
+        /internal/users/{id}/profile
     """
-
-    email_hash = _hash_value(email)
 
     return (
-        f"auth:email-cooldown:"
-        f"{purpose}:{email_hash}"
+        f"auth:profile:"
+        f"{scope}:v1:"
+        f"{user_id}"
     )
 
 
-async def acquire_email_cooldown(
-    purpose: str,
-    email: str,
-) -> tuple[bool, str]:
+async def get_profile_cache(
+    user_id: UUID | str,
+    scope: str,
+) -> dict | None:
     """
-    Пытаемся поставить Redis-ключ с NX + EX.
-
-    True  -> письмо можно отправлять.
-    False -> cooldown уже существует.
+    Получить сериализованный профиль из Redis.
     """
 
-    key = make_email_cooldown_key(
-        purpose,
-        email,
-    )
+    try:
+        raw = await redis_client.get(
+            _profile_key(
+                user_id,
+                scope,
+            )
+        )
 
-    acquired = await redis_client.set(
-        key,
-        "1",
-        nx=True,
-        ex=settings.EMAIL_SEND_COOLDOWN_SECONDS,
-    )
+        if raw is None:
+            return None
 
-    return bool(acquired), key
+        value = json.loads(raw)
+
+        if isinstance(value, dict):
+            return value
+
+        return None
+
+    except (
+        RedisError,
+        json.JSONDecodeError,
+    ):
+        return None
 
 
-async def release_email_cooldown(
-    key: str,
+async def set_profile_cache(
+    user_id: UUID | str,
+    scope: str,
+    value: dict,
 ) -> None:
     """
-    Удаляем cooldown, если отправка письма
-    завершилась ошибкой.
-
-    Тогда пользователь сможет сразу
-    попробовать ещё раз.
+    Сохраняем профиль с коротким TTL.
     """
 
-    await redis_client.delete(key)
+    try:
+        await redis_client.set(
+            _profile_key(
+                user_id,
+                scope,
+            ),
+            json.dumps(
+                value,
+                ensure_ascii=False,
+            ),
+            ex=max(
+                1,
+                settings.PROFILE_CACHE_TTL_SECONDS,
+            ),
+        )
 
+    except (
+        RedisError,
+        TypeError,
+    ):
+        pass
+
+
+async def invalidate_profile_cache(
+    user_id: UUID | str,
+) -> None:
+    """
+    После изменения профиля удаляем оба варианта cache.
+    """
+
+    try:
+        await redis_client.delete(
+            _profile_key(
+                user_id,
+                "me",
+            ),
+            _profile_key(
+                user_id,
+                "internal",
+            ),
+        )
+
+    except RedisError:
+        pass
+
+
+# =========================================================
+# SHUTDOWN
+# =========================================================
 
 async def close_redis() -> None:
     """
-    Корректно закрываем Redis connection pool.
+    Закрываем Redis connection pool.
     """
 
     await redis_client.aclose()
