@@ -1,56 +1,135 @@
 import logging
 from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from sqlalchemy import text
 
-# Импортируем роутеры и движок БД
-from app.routers import auth
-from app.routers import profile
-from app.routers import internal
 from app.database import engine
+from app.redis import close_redis
+from app.routers import (
+    auth,
+    internal,
+    profile,
+)
 
-# Настраиваем красивый вывод логов в консоль
+
+# =========================================================
+# LOGGING
+# =========================================================
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+    format=(
+        "%(asctime)s - "
+        "%(levelname)s - "
+        "%(message)s"
+    ),
 )
+
 logger = logging.getLogger(__name__)
 
-# Механизм lifespan выполняется один раз при запуске (и остановке) приложения
+
+# =========================================================
+# LIFESPAN
+# =========================================================
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("⏳ Пытаемся подключиться к базе данных PostgreSQL...")
-    try:
-        # Пробуем открыть соединение и выполнить простейший запрос
-        async with engine.begin() as conn:
-            await conn.execute(text("SELECT 1"))
-        logger.info("✅ Успешное подключение к базе данных!")
-    except Exception as e:
-        # Перехватываем любую ошибку (неверный пароль, хост недоступен и т.д.)
-        logger.error(f"❌ Не удалось подключиться к БД! Ошибка: {e}")
-        logger.warning("⚠️ Приложение запущено, но запросы к БД будут выдавать ошибку 500, пока база не поднимется.")
-        # Заметь: мы не делаем raise e, поэтому uvicorn не упадет
 
-    yield # Здесь приложение начинает обрабатывать входящие HTTP-запросы
-    
-    # Этот блок выполнится при остановке контейнера
-    logger.info("🛑 Завершение работы. Закрываем соединения с БД...")
+    logger.info(
+        "⏳ Пытаемся подключиться "
+        "к базе данных PostgreSQL..."
+    )
+
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("SELECT 1")
+            )
+
+        logger.info(
+            "✅ Успешное подключение к БД!"
+        )
+
+    except Exception as e:
+        logger.error(
+            "❌ Не удалось подключиться к БД! "
+            f"Ошибка: {e}"
+        )
+
+        logger.warning(
+            "⚠️ Приложение запущено, "
+            "но запросы к БД будут выдавать "
+            "ошибки, пока база не поднимется."
+        )
+
+    yield
+
+    # =====================================================
+    # SHUTDOWN
+    # =====================================================
+
+    logger.info(
+        "🛑 Завершение работы auth-svc..."
+    )
+
     await engine.dispose()
 
-# Создаем само приложение FastAPI, передавая ему наш lifespan
+    await close_redis()
+
+    logger.info(
+        "✅ Соединения PostgreSQL и Redis закрыты."
+    )
+
+
+# =========================================================
+# FASTAPI
+# =========================================================
+
 app = FastAPI(
     title="Auth Service",
-    description="Микросервис авторизации (REST API)",
+    description=(
+        "Микросервис авторизации "
+        "(REST API)"
+    ),
     version="1.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
 )
 
-# Подключаем наши роуты
-app.include_router(auth.router, prefix="/auth", tags=["Auth"])
-app.include_router(profile.router, prefix="/users", tags=["Profile"])
-app.include_router(internal.router, prefix="/internal", tags=["Internal"])
 
-# Эндпоинт для проверки жизнеспособности (Health Check)
-@app.get("/health", tags=["System"])
+# =========================================================
+# ROUTERS
+# =========================================================
+
+app.include_router(
+    auth.router,
+    prefix="/auth",
+    tags=["Auth"],
+)
+
+app.include_router(
+    profile.router,
+    prefix="/users",
+    tags=["Profile"],
+)
+
+app.include_router(
+    internal.router,
+    prefix="/internal",
+    tags=["Internal"],
+)
+
+
+# =========================================================
+# HEALTH
+# =========================================================
+
+@app.get(
+    "/health",
+    tags=["System"],
+)
 async def health_check():
-    return {"status": "ok", "service": "auth"}
+    return {
+        "status": "ok",
+        "service": "auth",
+    }
