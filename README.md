@@ -1,676 +1,425 @@
-# Auth Service — API и функциональность
+# Auth Service
 
-## 1. Назначение сервиса
+Микросервис аутентификации и управления пользователями проекта «Автонаставник».
 
-`auth-svc` — микросервис аутентификации и управления учётными записями пользователей. Он отвечает за регистрацию пользователей, подтверждение электронной почты, авторизацию, выдачу и обновление JWT access token, управление refresh token, выход из системы, восстановление пароля, работу с профилем пользователя и предоставление внутреннего API для других микросервисов.
+Сервис отвечает за:
 
-Сервис реализован на FastAPI и работает с PostgreSQL через SQLAlchemy. JWT используется для пользовательской аутентификации, а для межсервисных запросов предусмотрена отдельная схема с сервисным именем и сервисным токеном. Структура приложения разделяет authentication API, profile API и internal API.
-
-В рамках системы `auth-svc` является источником истины для данных об аккаунте пользователя и его профиле. Другие микросервисы могут обращаться к нему для получения информации о пользователе через защищённый internal API.
-
----
-
-## 2. Основные функции
-
-Сервис предоставляет следующие возможности:
-
-* регистрация пользователя;
-* хранение пароля в хешированном виде;
-* подтверждение email;
-* повторная отправка verification token;
-* авторизация по email и паролю;
-* выдача JWT access token;
-* выдача refresh token;
-* обновление access token через refresh token;
-* logout и отзыв refresh token;
-* проверка действительности access token;
+* регистрацию и подтверждение электронной почты;
+* авторизацию пользователей;
+* access и refresh tokens;
+* выход из системы и rotation refresh tokens;
 * восстановление пароля;
-* установка нового пароля по reset token;
-* получение профиля пользователя;
-* изменение профиля пользователя;
-* деактивация пользовательского аккаунта;
-* получение профиля пользователя другими микросервисами;
-* health check сервиса.
+* управление профилем пользователя;
+* административные сессии;
+* internal API для других микросервисов;
+* отправку verification/reset писем через SMTP;
+* краткоживущие auth-токены и кэш профилей через Redis.
 
 ---
 
-# 3. Архитектура авторизации
-
-Для обычного пользователя применяется JWT-based authentication.
-
-После успешной авторизации сервер возвращает access token:
-
-```json
-{
-  "access_token": "<JWT>",
-  "token_type": "bearer"
-}
-```
-
-Access token передаётся клиентом в каждом защищённом запросе:
-
-```http
-Authorization: Bearer <access_token>
-```
-
-JWT содержит идентификатор пользователя в `sub` и его роль в `role`. Срок жизни access token задаётся переменной `ACCESS_TOKEN_EXPIRE_MINUTES`.
-
-Refresh token используется отдельно от access token. Он хранится в `HttpOnly` cookie `refresh_token`, поэтому frontend не должен передавать его вручную в JSON body.
-
-Схематично процесс выглядит следующим образом:
+## Архитектура
 
 ```text
-                   +------------------+
-                   |     Frontend     |
-                   +---------+--------+
-                             |
-                             | POST /auth/login
-                             v
-                   +---------+--------+
-                   |    auth-svc      |
-                   +---------+--------+
-                      |           |
-                      |           |
-                      v           v
-                 PostgreSQL    JWT/refresh
+                    ┌──────────────────┐
+                    │     Frontend     │
+                    └────────┬─────────┘
+                             │
+                             ▼
+                         ┌───────┐
+                         │ nginx │
+                         └───┬───┘
+                             │
+                             ▼
+                     ┌───────────────┐
+                     │   auth-svc    │
+                     └───────┬───────┘
+                             │
+               ┌─────────────┼─────────────┐
+               │             │             │
+               ▼             ▼             ▼
+        ┌────────────┐ ┌────────────┐ ┌────────────┐
+        │ PostgreSQL │ │   Redis    │ │    SMTP    │
+        └────────────┘ └────────────┘ └────────────┘
 ```
 
-Для межсервисного взаимодействия используется другой механизм:
+PostgreSQL является основным хранилищем пользователей и состояния токенов.
+
+Redis используется как дополнительный быстрый слой для:
+
+* короткоживущих verification/reset tokens;
+* кэширования профилей;
+* временного состояния, которому не требуется постоянное хранение.
+
+SMTP используется для отправки:
+
+* писем подтверждения электронной почты;
+* писем восстановления пароля.
+
+---
+
+# Основные endpoint'ы
+
+## Аутентификация
+
+| Метод  | Endpoint                    | Назначение                   |
+| ------ | --------------------------- | ---------------------------- |
+| `POST` | `/auth/register`            | Регистрация пользователя     |
+| `POST` | `/auth/login`               | Авторизация                  |
+| `POST` | `/auth/refresh`             | Обновление access token      |
+| `POST` | `/auth/logout`              | Выход                        |
+| `GET`  | `/auth/verify-email`        | Подтверждение email          |
+| `POST` | `/auth/resend-verification` | Повторная отправка письма    |
+| `POST` | `/auth/forgot-password`     | Запрос восстановления пароля |
+| `POST` | `/auth/update-password`     | Установка нового пароля      |
+
+## Проверка пользователя nginx
+
+| Метод  | Endpoint                    | Назначение               |
+| ------ | --------------------------- | ------------------------ |
+| `GET`  | `/auth/validate`            | Проверка access JWT      |
+| `POST` | `/auth/admin-session`       | Создание admin session   |
+| `POST` | `/auth/admin-session/close` | Завершение admin session |
+| `GET`  | `/auth/validate-admin`      | Проверка admin session   |
+
+## Профиль
+
+| Метод    | Endpoint    | Назначение               |
+| -------- | ----------- | ------------------------ |
+| `GET`    | `/users/me` | Получить текущий профиль |
+| `PATCH`  | `/users/me` | Изменить профиль         |
+| `DELETE` | `/users/me` | Деактивировать аккаунт   |
+
+## Internal API
+
+| Метод | Endpoint                            | Назначение                        |
+| ----- | ----------------------------------- | --------------------------------- |
+| `GET` | `/internal/users/{user_id}/profile` | Получение профиля другим сервисом |
+
+Internal API используется другими микросервисами, например `chat-svc`.
+
+---
+
+# Хранение токенов
+
+Токены генерируются через криптографически стойкий генератор случайных значений.
+
+Raw token не сохраняется в PostgreSQL.
+
+В PostgreSQL записывается только SHA-256 hash:
 
 ```text
-chat-svc / library-svc / ...
-            |
-            | X-Service-Name
-            | X-Service-Token
-            v
-        auth-svc
-            |
-            v
-       user profile
+raw token
+    │
+    ▼
+ SHA-256
+    │
+    ▼
+PostgreSQL
 ```
 
-Проверка internal API основана на `TRUSTED_SERVICE_TOKENS`.
-
----
-
-# 4. Base URL
-
-При стандартном запуске API доступен по адресу:
+Например:
 
 ```text
-http://<auth-svc-host>:8000
+email_verifications
+├── user_id
+├── token_hash
+├── created_at
+└── used_at
 ```
 
-В Docker hostname должен соответствовать имени контейнера или сервиса в Docker Compose.
-
-FastAPI также автоматически предоставляет OpenAPI/Swagger интерфейс, если он не отключён конфигурацией приложения.
-
----
-
-# 5. Authentication API
-
-Все authentication endpoints находятся под префиксом:
+Для refresh token:
 
 ```text
-/auth
+refresh_tokens
+├── user_id
+├── token_hash
+├── created_at
+├── revoked_at
+├── replaced_by_token_id
+├── ip_address
+└── user_agent
 ```
 
-## 5.1 Регистрация
-
-### `POST /auth/register`
-
-Создаёт нового пользователя.
-
-Request:
-
-```json
-{
-  "email": "student@example.com",
-  "password": "strong-password"
-}
-```
-
-Поля:
-
-| Поле       | Тип    | Обязательное |
-| ---------- | ------ | ------------ |
-| `email`    | string | да           |
-| `password` | string | да           |
-
-При создании пользователя сервис создаёт учётную запись и связанный профиль пользователя. Для нового пользователя также создаётся verification token.
-
-Успешный результат:
-
-```http
-201 Created
-```
-
-Пример ответа:
-
-```json
-{
-  "id": "6e9d...",
-  "email": "student@example.com",
-  "role": "student",
-  "is_email_verified": false,
-  "is_active": true
-}
-```
-
-Если пользователь уже существует и его email подтверждён, сервис возвращает ошибку `400`.
-
-Если пользователь существует, но email ещё не подтверждён, текущая реализация позволяет повторно инициировать процесс регистрации/подтверждения.
-
----
-
-## 5.2 Повторная отправка подтверждения email
-
-### `POST /auth/resend-verification`
-
-Создаёт новый verification token для существующего неподтверждённого пользователя.
-
-Request:
-
-```json
-{
-  "email": "student@example.com"
-}
-```
-
-Ответ:
-
-```json
-{
-  "detail": "If the account exists and is unverified, a new link has been sent."
-}
-```
-
-API намеренно не раскрывает, существует ли указанный email, чтобы не позволять проверять наличие аккаунтов по email.
-
----
-
-## 5.3 Подтверждение email
-
-### `GET /auth/verify-email?token=<token>`
-
-Подтверждает email пользователя.
-
-Пример:
-
-```http
-GET /auth/verify-email?token=<verification-token>
-```
-
-При успешной обработке:
+Для password reset:
 
 ```text
-is_email_verified = true
-```
-
-Verification token становится использованным.
-
-Ответ:
-
-```json
-{
-  "msg": "Email successfully verified"
-}
-```
-
-При некорректном или уже использованном token:
-
-```http
-400 Bad Request
+password_resets
+├── user_id
+├── token_hash
+├── created_at
+├── used_at
+├── requested_ip
+└── requested_user_agent
 ```
 
 ---
 
-## 5.4 Авторизация
+# Redis
 
-### `POST /auth/login`
+Redis не заменяет PostgreSQL.
 
-Авторизация пользователя по email и паролю.
+PostgreSQL остаётся источником истины, а Redis используется как быстрый временный слой.
 
-Request:
-
-```json
-{
-  "email": "student@example.com",
-  "password": "strong-password"
-}
-```
-
-Для успешной авторизации пользователь должен:
-
-* существовать;
-* иметь корректный пароль;
-* быть активным;
-* иметь подтверждённый email.
-
-При успешной авторизации сервис возвращает access token и создаёт refresh token.
-
-Ответ:
-
-```json
-{
-  "access_token": "<JWT>",
-  "token_type": "bearer"
-}
-```
-
-Refresh token одновременно устанавливается в cookie:
+## Verification token
 
 ```text
-refresh_token=<token>
+auth:token:verify:v1:<sha256>
 ```
 
-Cookie имеет атрибут `HttpOnly`, что препятствует чтению значения через JavaScript.
+TTL задаётся параметром:
 
----
-
-## 5.5 Обновление access token
-
-### `POST /auth/refresh`
-
-Используется для получения нового access token без повторного ввода логина и пароля.
-
-Refresh token передаётся автоматически через cookie:
-
-```http
-Cookie: refresh_token=<refresh-token>
+```env
+EMAIL_VERIFY_TOKEN_EXPIRE_MINUTES
 ```
 
-Request body не требуется.
-
-Ответ:
-
-```json
-{
-  "access_token": "<new-access-token>",
-  "token_type": "bearer"
-}
-```
-
-При успешном refresh старый refresh token отзывается, создаётся новый refresh token и обновляется cookie.
-
-В текущей реализации lifetime refresh token установлен непосредственно в коде и составляет 30 дней.
-
----
-
-## 5.6 Logout
-
-### `POST /auth/logout`
-
-Выполняет выход из системы.
-
-Сервис отзывает refresh token и удаляет соответствующую cookie.
-
-Пример:
-
-```http
-POST /auth/logout
-Cookie: refresh_token=<refresh-token>
-```
-
-Ответ:
-
-```json
-{
-  "detail": "Successfully logged out"
-}
-```
-
----
-
-## 5.7 Проверка access token
-
-### `GET /auth/validate`
-
-Проверяет JWT access token.
-
-Request:
-
-```http
-Authorization: Bearer <access-token>
-```
-
-При успешной проверке:
-
-```json
-{
-  "status": "valid"
-}
-```
-
-Кроме тела ответа, сервис возвращает headers:
-
-```http
-X-User-Id: <user-uuid>
-X-User-Role: <user-role>
-```
-
-Этот endpoint предназначен в первую очередь для gateway/Nginx.
-
-Схема работы может выглядеть так:
+## Password reset token
 
 ```text
-Client
-   |
-   | Authorization: Bearer JWT
-   v
-Gateway / Nginx
-   |
-   | GET /auth/validate
-   v
-auth-svc
-   |
-   | X-User-Id
-   | X-User-Role
-   v
-downstream service
+auth:token:reset:v1:<sha256>
 ```
 
-Таким образом, downstream-сервису не обязательно самостоятельно реализовывать проверку JWT.
+TTL задаётся параметром:
+
+```env
+PASSWORD_RESET_TOKEN_EXPIRE_MINUTES
+```
+
+Если Redis недоступен или ключ отсутствует, сервис использует PostgreSQL.
+
+Это означает, что отказ Redis не должен приводить к полной недоступности authentication.
 
 ---
 
-## 5.8 Восстановление пароля
+# Кэш профилей
 
-### `POST /auth/forgot-password`
+Профили пользователей кэшируются в Redis.
 
-Инициирует процедуру восстановления пароля.
-
-Request:
-
-```json
-{
-  "email": "student@example.com"
-}
-```
-
-Если пользователь существует, сервис создаёт одноразовый reset token.
-
-API возвращает одинаковый ответ независимо от существования аккаунта:
-
-```json
-{
-  "detail": "If the email is registered, a password reset link has been sent."
-}
-```
-
-Это предотвращает раскрытие списка зарегистрированных пользователей.
-
-### Важная особенность текущей реализации
-
-В текущей версии SMTP-отправка письма фактически не реализована. Вместо отправки email ссылка для восстановления выводится в stdout контейнера. Следовательно, `forgot-password` функционально генерирует reset token, но полноценная отправка письма через SMTP пока отсутствует.
-
----
-
-## 5.9 Установка нового пароля
-
-### `POST /auth/update-password`
-
-Используется с reset token.
-
-Request:
-
-```json
-{
-  "token": "<reset-token>",
-  "new_password": "new-strong-password"
-}
-```
-
-Token должен существовать и не быть использованным.
-
-Текущий код считает reset token недействительным после одного часа.
-
-При успехе:
-
-```json
-{
-  "detail": "Password has been updated successfully"
-}
-```
-
-После использования token становится недействительным.
-
----
-
-# 6. User Profile API
-
-API профиля находится под префиксом:
+## Профиль `/users/me`
 
 ```text
-/users
+auth:profile:me:v1:<user_id>
 ```
 
-В текущей архитектуре профиль идентифицируется через `X-User-Id`.
-
-Этот header должен быть установлен после успешной проверки JWT gateway-уровнем.
-
----
-
-## 6.1 Получение собственного профиля
-
-### `GET /users/me`
-
-Возвращает профиль текущего пользователя.
-
-Пример ответа:
-
-```json
-{
-  "user_id": "6e9d...",
-  "first_name": "Ivan",
-  "last_name": "Ivanov",
-  "telegram_username": "ivanov",
-  "university_id": "uuid",
-  "campus_id": "uuid",
-  "faculty_id": "uuid",
-  "program_id": "uuid",
-  "year": 3,
-  "group_name": "ИУ7-21",
-  "role": "student"
-}
-```
-
-Профиль содержит основные персональные и учебные данные пользователя.
-
-Поле `role` хранится не в профиле, а в самой учётной записи, и подставляется в ответ
-отдельно — фронтенду оно нужно, чтобы решать, показывать ли вход в админ-панель. `PATCH`
-возвращает его так же: иначе после сохранения профиля кнопка исчезала бы.
-
----
-
-## 6.2 Изменение профиля
-
-### `PATCH /users/me`
-
-Позволяет частично изменить профиль.
-
-Пример:
-
-```json
-{
-  "first_name": "Ivan",
-  "last_name": "Ivanov",
-  "telegram_username": "ivanov",
-  "university_id": "uuid",
-  "faculty_id": "uuid",
-  "program_id": "uuid",
-  "year": 3,
-  "group_name": "ИУ7-21"
-}
-```
-
-Все поля являются опциональными.
-
-Обновляются только поля, которые были переданы в запросе.
-
----
-
-## 6.3 Деактивация аккаунта
-
-### `DELETE /users/me`
-
-Удаляет учётную запись пользователя с точки зрения приложения.
-
-При этом физического удаления строки пользователя из PostgreSQL не происходит.
-
-Вместо этого:
+## Internal profile API
 
 ```text
-is_active = false
+auth:profile:internal:v1:<user_id>
 ```
 
-То есть используется soft delete.
+TTL:
 
-Это позволяет сохранить связанные данные пользователя и не нарушать связи с другими сущностями системы, например историей сообщений.
-
-Успешный ответ:
-
-```http
-204 No Content
+```env
+PROFILE_CACHE_TTL_SECONDS=300
 ```
 
----
+то есть по умолчанию 5 минут.
 
-# 7. Internal API для микросервисов
-
-Internal API находится под префиксом:
+Алгоритм:
 
 ```text
-/internal
+GET /users/me
+      │
+      ▼
+    Redis
+      │
+   ┌──┴──┐
+ hit    miss
+  │       │
+  │       ▼
+  │   PostgreSQL
+  │       │
+  └───────┘
+      │
+      ▼
+   response
 ```
 
-Эти endpoints не предназначены для frontend.
-
-Они используются другими сервисами системы.
+После изменения профиля Redis cache инвалидируется.
 
 ---
 
-## 7.1 Получение профиля пользователя
+# SMTP
 
-### `GET /internal/users/{user_id}/profile`
+SMTP используется для отправки:
 
-Возвращает данные пользователя по его UUID.
+1. confirmation email;
+2. password reset email.
 
-Пример:
+Ссылки больше не выводятся в `stdout`.
 
-```http
-GET /internal/users/6e9d.../profile
-```
-
-Для обращения должны присутствовать headers:
-
-```http
-X-Service-Name: chat-svc
-X-Service-Token: <service-token>
-```
-
-`auth-svc` проверяет соответствие `X-Service-Name` и token записи в `TRUSTED_SERVICE_TOKENS`.
-
-При отсутствии необходимых headers:
-
-```http
-401 Unauthorized
-```
-
-При неверном service token:
-
-```http
-403 Forbidden
-```
-
-Успешный ответ:
-
-```json
-{
-  "id": "6e9d...",
-  "email": "student@example.com",
-  "role": "student",
-  "profile": {
-    "first_name": "Ivan",
-    "last_name": "Ivanov",
-    "telegram_username": "ivanov",
-    "university_id": "uuid",
-    "campus_id": "uuid",
-    "faculty_id": "uuid",
-    "program_id": "uuid",
-    "year": 3,
-    "group_name": "ИУ7-21",
-    "preferences": {}
-  }
-}
-```
-
-Этот endpoint позволяет, например, `chat-svc` получить информацию о пользователе, не храня собственную копию пользовательских данных.
-
----
-
-# 7.2 Админ-сессия для входа в панель администрирования
-
-Панель `db-svc` доступна через nginx по пути `/admin/` и закрыта отдельной короткоживущей
-сессией. Обычный access-токен для входа не подходит: переход в панель — это навигация
-браузера, а в ней нет заголовка `Authorization` (токен живёт в памяти фронтенда и
-добавляется только в `fetch`). Передавать JWT в query, как сделано для WebSocket, не стали:
-он оседал бы в истории браузера, логах nginx и в `Referer`.
-
-### `POST /auth/admin-session`
-
-Вызывается фронтендом при нажатии кнопки «Админка». Пользователь определяется по
-`X-User-Id`, который проставил nginx после проверки access-токена, — то есть без валидного
-токена в этот роут не попасть.
-
-Если роль не `admin`, возвращается `404` (а не `403`): существование раздела не
-подтверждается тем, у кого нет прав. Это не замена проверке прав, а отсутствие лишнего сигнала.
-
-При успехе ставится HttpOnly-кука:
+Пример verification URL:
 
 ```text
-admin_session=<JWT>; HttpOnly; SameSite=Lax; Path=/admin; Max-Age=1800
+https://example.com/verify-email?token=<token>
 ```
 
-```json
-{ "status": "ok", "expires_in": 1800, "url": "/admin/" }
+Пример reset URL:
+
+```text
+https://example.com/reset-password?token=<token>
 ```
-
-`Path=/admin` означает, что на обычные запросы приложения кука не отправляется вовсе.
-Адрес панели возвращается в ответе, чтобы не дублировать его во фронтенде.
-
-### `POST /auth/admin-session/close`
-
-Гасит сессию досрочно (выход из панели).
-
-### `GET /auth/validate-admin`
-
-`auth_request`-эндпоинт для nginx: `200` только обладателю действующей админ-сессии, иначе
-`403`. При отказе nginx к `db-svc` не обращается вовсе, поэтому HTML и JS панели не покидают
-контур.
-
-Роль перепроверяется в базе, а не берётся из токена: если у пользователя отозвали `admin`,
-доступ пропадает сразу, не дожидаясь истечения куки.
-
-### Разделение токенов
-
-Токен админ-сессии подписан тем же ключом, что и access-токен, поэтому их различает claim
-`scope: "admin_panel"`:
-
-* `get_user_from_token` (обычная авторизация) **отклоняет** токены с этим scope — админ-кука
-  не может работать как access-токен;
-* `get_admin_from_cookie` **требует** этот scope — обычный access-токен, подложенный в куку,
-  админку не откроет.
 
 ---
 
-# 8. Health Check
+# Настройка Gmail SMTP
 
-### `GET /health`
+Для Gmail можно использовать:
 
-Используется для проверки доступности сервиса.
+```env
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USE_TLS=true
+SMTP_USE_SSL=false
 
-Ответ:
+SMTP_USER=example@gmail.com
+SMTP_PASSWORD=<app-password>
+
+EMAIL_FROM=example@gmail.com
+```
+
+Для SMTP authentication рекомендуется использовать пароль приложения, а не обычный пароль аккаунта.
+
+---
+
+# Переменные окружения
+
+## Database
+
+```env
+DATABASE_URL=postgresql+asyncpg://user:password@postgres:5432/database
+```
+
+## JWT
+
+```env
+SECRET_KEY=change-me
+ALGORITHM=HS256
+ACCESS_TOKEN_EXPIRE_MINUTES=15
+```
+
+## Token TTL
+
+```env
+REFRESH_TOKEN_EXPIRE_MINUTES=43200
+EMAIL_VERIFY_TOKEN_EXPIRE_MINUTES=1440
+PASSWORD_RESET_TOKEN_EXPIRE_MINUTES=60
+```
+
+По умолчанию:
+
+| Токен              |      TTL |
+| ------------------ | -------: |
+| Access JWT         | 15 минут |
+| Refresh token      |  30 дней |
+| Email verification |  24 часа |
+| Password reset     |    1 час |
+
+## Frontend
+
+```env
+FRONTEND_BASE_URL=http://localhost
+```
+
+Этот URL используется для построения ссылок в email.
+
+## SMTP
+
+```env
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+
+SMTP_USER=
+SMTP_PASSWORD=
+
+SMTP_USE_TLS=true
+SMTP_USE_SSL=false
+
+EMAIL_FROM=
+```
+
+## Redis
+
+```env
+REDIS_URL=redis://redis:6379/0
+PROFILE_CACHE_TTL_SECONDS=300
+```
+
+---
+
+# Пример `.env`
+
+```env
+# PostgreSQL
+DATABASE_URL=postgresql+asyncpg://auth_user:auth_password@postgres:5432/auth_db
+
+# JWT
+SECRET_KEY=replace-with-random-secret
+ALGORITHM=HS256
+ACCESS_TOKEN_EXPIRE_MINUTES=15
+
+# Token TTL
+REFRESH_TOKEN_EXPIRE_MINUTES=43200
+EMAIL_VERIFY_TOKEN_EXPIRE_MINUTES=1440
+PASSWORD_RESET_TOKEN_EXPIRE_MINUTES=60
+
+# Frontend
+FRONTEND_BASE_URL=http://localhost
+
+# SMTP
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=your-email@gmail.com
+SMTP_PASSWORD=your-app-password
+SMTP_USE_TLS=true
+SMTP_USE_SSL=false
+EMAIL_FROM=your-email@gmail.com
+
+# Redis
+REDIS_URL=redis://redis:6379/0
+PROFILE_CACHE_TTL_SECONDS=300
+```
+
+---
+
+# Установка
+
+Установить зависимости:
+
+```bash
+pip install -r requirements.txt
+```
+
+Основные зависимости:
+
+```text
+FastAPI
+SQLAlchemy
+asyncpg
+bcrypt
+PyJWT
+pydantic-settings
+redis
+```
+
+SMTP реализован через стандартную библиотеку Python `smtplib`, поэтому отдельная SMTP-библиотека не требуется.
+
+---
+
+# Локальный запуск
+
+Заполнить `.env`, после чего:
+
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+Проверка:
+
+```bash
+curl http://localhost:8000/health
+```
+
+Ожидаемый ответ:
 
 ```json
 {
@@ -679,234 +428,263 @@ admin_session=<JWT>; HttpOnly; SameSite=Lax; Path=/admin; Max-Age=1800
 }
 ```
 
-Endpoint подходит для Docker healthcheck, orchestration и мониторинга.
-
 ---
 
-# 9. Модель пользователя
+# Docker
 
-На уровне функциональности пользователь имеет как минимум следующие атрибуты:
+В общей инфраструктуре проекта `auth-svc` использует существующие PostgreSQL и Redis.
 
-```text
-id
-email
-password
-role
-is_email_verified
-is_active
-```
-
-Отдельно связан профиль пользователя.
-
-Профиль хранит данные, связанные с пользовательским контекстом:
-
-```text
-first_name
-last_name
-telegram_username
-university_id
-campus_id
-faculty_id
-program_id
-year
-group_name
-preferences
-```
-
-Таким образом, сервис разделяет authentication data и profile data, сохраняя их связанными.
-
----
-
-# 10. Работа с ролями
-
-JWT содержит поле:
-
-```text
-role
-```
-
-Поэтому роль пользователя доступна другим компонентам системы после проверки токена.
-
-Например:
-
-```json
-{
-  "sub": "6e9d...",
-  "role": "student"
-}
-```
-
-Текущая реализация поддерживает использование роли как части authentication context.
-
----
-
-# 11. Работа с PostgreSQL
-
-`auth-svc` напрямую подключается к PostgreSQL.
-
-Connection string задаётся переменной:
+Redis подключается через:
 
 ```env
-DATABASE_URL=postgresql+asyncpg://...
+REDIS_URL=redis://redis:6379/0
 ```
 
-`DATABASE_URL` используется непосредственно модулем подключения к БД.
-
-Важно, что `DATABASE_URL` относится к соединению **самого auth-сервиса с PostgreSQL**, а не к взаимодействию между микросервисами.
-
-При Docker-запуске hostname БД должен указывать на имя PostgreSQL-сервиса в Docker network, например:
-
-```env
-DATABASE_URL=postgresql+asyncpg://app_user:app_password@postgres:5432/auth_db
-```
+Отдельный Redis специально для `auth-svc` не требуется.
 
 ---
 
-# 12. Переменные окружения
+# Взаимодействие с другими сервисами
 
-Для текущей реализации основными рабочими переменными являются:
+## nginx
 
-```env
-DATABASE_URL
-
-SECRET_KEY
-ALGORITHM
-ACCESS_TOKEN_EXPIRE_MINUTES
-
-INTERNAL_AUTH_HEADER_NAME
-INTERNAL_SERVICE_NAME_HEADER
-TRUSTED_SERVICE_TOKENS
-
-ADMIN_SESSION_COOKIE_NAME
-ADMIN_SESSION_EXPIRE_MINUTES
-ADMIN_SESSION_COOKIE_PATH
-ADMIN_SESSION_COOKIE_SECURE
-```
-
-Назначение:
-
-| Переменная                     | Назначение                                   |
-| ------------------------------ | -------------------------------------------- |
-| `DATABASE_URL`                 | Подключение auth-svc к PostgreSQL            |
-| `SECRET_KEY`                   | Секрет для подписи JWT                       |
-| `ALGORITHM`                    | Алгоритм подписи JWT                         |
-| `ACCESS_TOKEN_EXPIRE_MINUTES`  | Срок действия access token                   |
-| `INTERNAL_AUTH_HEADER_NAME`    | Название header с internal service token     |
-| `INTERNAL_SERVICE_NAME_HEADER` | Название header с именем вызывающего сервиса |
-| `TRUSTED_SERVICE_TOKENS`       | Разрешённые service-to-service credentials   |
-| `ADMIN_SESSION_COOKIE_NAME`    | Имя куки админ-сессии (по умолчанию `admin_session`) |
-| `ADMIN_SESSION_EXPIRE_MINUTES` | Срок жизни админ-сессии, минут (по умолчанию 30) |
-| `ADMIN_SESSION_COOKIE_PATH`    | Путь куки — ограничивает её областью админки (`/admin`) |
-| `ADMIN_SESSION_COOKIE_SECURE`  | Отдавать куку только по HTTPS. В проде — `true`  |
-
-В текущей версии `REDIS_URL`, SMTP-переменные и несколько переменных, связанных со сроками действия отдельных токенов, не являются рабочими настройками существующей реализации.
-
----
-
-# 13. Важные ограничения текущей реализации
-
-Документация должна учитывать не только предусмотренную функциональность, но и фактическое поведение текущего кода.
-
-### Email
-
-Verification и password reset поддерживаются на уровне API, однако полноценная отправка email через SMTP ещё не реализована. Сейчас ссылки выводятся в stdout приложения.
-
-### Refresh token lifetime
-
-Срок действия refresh token не вынесен в environment configuration. Сейчас используется фиксированное значение 30 дней.
-
-### Verification token lifetime
-
-Несмотря на наличие соответствующей переменной в старом `.env.example`, текущая реализация не использует `EMAIL_VERIFY_TOKEN_EXPIRE_MINUTES` для проверки срока действия verification token.
-
-### Password reset lifetime
-
-Срок жизни reset token определяется непосредственно кодом и составляет один час.
-
-### Redis
-
-`auth-svc` не использует Redis в текущей реализации.
-
-### Soft delete
-
-`DELETE /users/me` не удаляет пользователя физически, а только деактивирует его.
-
-### Internal API
-
-Internal API защищён отдельным сервисным механизмом и не должен быть доступен публичным клиентам.
-
----
-
-# 14. Итоговая роль auth-svc в системе
-
-В микросервисной архитектуре `auth-svc` выполняет роль центрального сервиса идентификации пользователя.
-
-Его ответственность:
+nginx выполняет JWT validation через:
 
 ```text
-                    +------------------+
-                    |     Frontend     |
-                    +--------+---------+
-                             |
-                             | login / refresh / profile
-                             v
-                    +--------+---------+
-                    |    auth-svc      |
-                    +--------+---------+
-                       |      |      |
-                       |      |      |
-                       v      v      v
-                  PostgreSQL  JWT  Internal API
-                                      |
-                         +------------+-------------+
-                         |            |             |
-                         v            v             v
-                     chat-svc    library-svc     другие
+GET /auth/validate
 ```
 
-То есть `auth-svc` отвечает за:
-
-**Кто пользователь?**
+После успешной проверки передаёт:
 
 ```text
-email
-password
-JWT
-refresh token
-role
-is_active
-is_email_verified
+X-User-Id
+X-User-Role
 ```
 
-**Какие данные профиля у него есть?**
+в downstream-сервисы.
+
+Для административного раздела используется:
 
 ```text
-first_name
-last_name
-Telegram
-university
-faculty
-program
-group
-year
-preferences
+POST /auth/admin-session
+GET  /auth/validate-admin
+POST /auth/admin-session/close
 ```
 
-**Можно ли доверять запросу от другого микросервиса?**
+## chat-svc
+
+`chat-svc` может получать профиль пользователя через:
 
 ```text
-X-Service-Name
-X-Service-Token
-TRUSTED_SERVICE_TOKENS
-```
-
-**Может ли другой сервис получить информацию о пользователе?**
-
-Да, через:
-
-```http
 GET /internal/users/{user_id}/profile
 ```
 
-Таким образом, `auth-svc` является не просто endpoint'ом для login, а центральным сервисом управления identity пользователя и его профилем, через который остальные микросервисы получают необходимый authentication context.
+Доступ к internal API защищён service-to-service authentication.
 
+Профиль дополнительно кэшируется в Redis.
+
+## library-svc
+
+`library-svc` не хранит собственные пользовательские auth-токены. Пользовательская авторизация выполняется через существующий gateway/auth flow.
+
+---
+
+# Безопасность
+
+## Raw tokens
+
+Raw verification/reset tokens:
+
+* не сохраняются в PostgreSQL;
+* не сохраняются в Redis;
+* не выводятся в stdout.
+
+В PostgreSQL и Redis используется только SHA-256 hash.
+
+## Refresh tokens
+
+Refresh token хранится в HttpOnly cookie.
+
+При `/auth/refresh` выполняется rotation:
+
+```text
+old refresh token
+       ↓
+revoked
+       ↓
+new refresh token
+```
+
+Каждый refresh token имеет срок жизни из:
+
+```env
+REFRESH_TOKEN_EXPIRE_MINUTES
+```
+
+## One-time tokens
+
+Verification и password-reset tokens являются одноразовыми.
+
+После успешного использования:
+
+```text
+used_at = now()
+```
+
+и соответствующий Redis key удаляется.
+
+---
+
+# Изменение профиля и кэш
+
+При:
+
+```text
+PATCH /users/me
+```
+
+данные сначала обновляются в PostgreSQL.
+
+После успешного изменения cache профиля удаляется:
+
+```text
+PostgreSQL UPDATE
+      ↓
+Redis DELETE
+```
+
+Следующий запрос загрузит актуальный профиль из PostgreSQL и снова сохранит его в Redis.
+
+---
+
+# Поведение при отказе Redis
+
+Redis является дополнительным cache/TTL-слоем.
+
+Если Redis временно недоступен:
+
+```text
+Redis request
+     ↓
+ошибка
+     ↓
+PostgreSQL
+```
+
+Это позволяет сохранить работу основных authentication flows.
+
+---
+
+# Структура приложения
+
+```text
+app/
+├── main.py
+├── config.py
+├── database.py
+├── mail.py
+├── models.py
+├── redis.py
+├── schemas.py
+├── security.py
+│
+└── routers/
+    ├── auth.py
+    ├── profile.py
+    └── internal.py
+```
+
+Назначение модулей:
+
+| Файл                  | Назначение                          |
+| --------------------- | ----------------------------------- |
+| `main.py`             | FastAPI application и lifecycle     |
+| `config.py`           | SMTP/Redis/TTL configuration        |
+| `database.py`         | PostgreSQL                          |
+| `mail.py`             | SMTP отправка                       |
+| `redis.py`            | Redis cache и temporary state       |
+| `models.py`           | SQLAlchemy models                   |
+| `schemas.py`          | Pydantic schemas                    |
+| `security.py`         | JWT/password/service authentication |
+| `routers/auth.py`     | Authentication endpoints            |
+| `routers/profile.py`  | User profile                        |
+| `routers/internal.py` | Internal service API                |
+
+---
+
+# Проверка после запуска
+
+## Health
+
+```bash
+curl http://localhost:8000/health
+```
+
+## Redis
+
+Проверить контейнер Redis:
+
+```bash
+redis-cli ping
+```
+
+Ожидаемый ответ:
+
+```text
+PONG
+```
+
+Проверить auth keys:
+
+```bash
+redis-cli --scan --pattern 'auth:*'
+```
+
+Пример:
+
+```text
+auth:profile:me:v1:<user_id>
+auth:profile:internal:v1:<user_id>
+auth:token:verify:v1:<hash>
+auth:token:reset:v1:<hash>
+```
+
+## SMTP
+
+После регистрации:
+
+```text
+POST /auth/register
+```
+
+пользователь должен получить confirmation email.
+
+После:
+
+```text
+POST /auth/forgot-password
+```
+
+пользователь должен получить password reset email.
+
+Ссылки больше не должны появляться в stdout.
+
+---
+
+# Главное правило хранения данных
+
+```text
+PostgreSQL
+    ↓
+источник истины
+
+Redis
+    ↓
+быстрый временный слой
+
+SMTP
+    ↓
+доставка email
+```
+
+Redis не заменяет PostgreSQL и не используется для хранения долгоживущего состояния пользователя.
