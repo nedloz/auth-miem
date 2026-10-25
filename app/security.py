@@ -1,3 +1,4 @@
+import hmac
 import json
 import logging
 import os
@@ -56,6 +57,31 @@ def _load_trusted_service_tokens() -> dict[str, str]:
     return normalized
 
 
+# Заглушки из .env.example и слишком короткие значения не годятся в качестве токена:
+# это единственное, что защищает внутренние API.
+WEAK_TOKEN_MARKERS = ("super-secret-token", "change-me", "change_me", "changeme")
+MIN_TOKEN_LENGTH = 24
+
+
+def validate_trusted_service_tokens() -> None:
+    """Останавливает запуск, если в TRUSTED_SERVICE_TOKENS остались предсказуемые токены.
+
+    Токены генерирует scripts/gen_service_tokens.py в корне репозитория main.
+    """
+    weak = [
+        name
+        for name, token in _load_trusted_service_tokens().items()
+        if len(token) < MIN_TOKEN_LENGTH
+        or any(marker in token.lower() for marker in WEAK_TOKEN_MARKERS)
+    ]
+    if weak:
+        raise RuntimeError(
+            f"Слабые токены в TRUSTED_SERVICE_TOKENS для: {', '.join(weak)}. "
+            f"Нужны случайные значения длиной не менее {MIN_TOKEN_LENGTH} символов "
+            "(scripts/gen_service_tokens.py)."
+        )
+
+
 def _extract_internal_header_value(headers: dict[str, str], header_name: str) -> str | None:
     return headers.get(header_name.lower())
 
@@ -81,7 +107,9 @@ async def verify_internal_service_request(
     trusted_service_tokens = _load_trusted_service_tokens()
     expected_token = trusted_service_tokens.get(service_name)
 
-    if expected_token is None or expected_token != service_token:
+    if expected_token is None or not hmac.compare_digest(
+        expected_token.encode(), service_token.encode()
+    ):
         logger.warning("Internal API forbidden for service=%s", service_name)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

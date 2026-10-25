@@ -6,6 +6,7 @@ from sqlalchemy import text
 
 from app.database import engine
 from app.redis import close_redis
+from app.security import validate_trusted_service_tokens
 from app.routers import (
     auth,
     internal,
@@ -35,6 +36,8 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+
+    validate_trusted_service_tokens()
 
     logger.info(
         "⏳ Пытаемся подключиться "
