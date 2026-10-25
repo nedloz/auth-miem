@@ -51,10 +51,15 @@ async def get_my_profile(
         "me",
     )
 
+    # Роль лежит в учётной записи, а не в профиле, но фронтенд решает по ней, показывать ли
+    # вход в админ-панель. Берём её из current_user каждый раз, а не из кэша: смена роли
+    # в базе не должна ждать истечения TTL.
     if cached is not None:
-        return UserProfileRead.model_validate(
+        payload = UserProfileRead.model_validate(
             cached
         )
+        payload.role = current_user.role
+        return payload
 
     stmt = select(UserProfile).where(
         UserProfile.user_id == current_user.id
@@ -73,6 +78,7 @@ async def get_my_profile(
     response = UserProfileRead.model_validate(
         profile
     )
+    response.role = current_user.role
 
     await set_profile_cache(
         current_user.id,
@@ -143,7 +149,14 @@ async def update_my_profile(
         current_user.id
     )
 
-    return profile
+    # Без роли ответ PATCH затирал бы её на фронтенде, и кнопка админ-панели пропадала бы
+    # после первого же сохранения профиля.
+    updated = UserProfileRead.model_validate(
+        profile
+    )
+    updated.role = current_user.role
+
+    return updated
 
 
 # -------------------------------------------------------------------
