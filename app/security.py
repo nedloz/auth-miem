@@ -1,10 +1,9 @@
-import hmac
-import json
+import ipaddress
 import logging
 import os
 from datetime import datetime, timedelta, timezone
 import bcrypt
-from fastapi import Cookie, Depends, HTTPException, status, Header
+from fastapi import Cookie, Depends, Header, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -34,91 +33,44 @@ ADMIN_SESSION_COOKIE_SECURE = os.getenv("ADMIN_SESSION_COOKIE_SECURE", "false").
 # Значение claim "scope" у токена админ-сессии. Токены с этим scope НЕ должны работать
 # как обычные access-токены, и наоборот — см. get_user_from_token и get_admin_from_cookie.
 ADMIN_SESSION_SCOPE = "admin_panel"
-INTERNAL_AUTH_HEADER_NAME = os.getenv("INTERNAL_AUTH_HEADER_NAME", "X-Service-Token")
-INTERNAL_SERVICE_NAME_HEADER = os.getenv("INTERNAL_SERVICE_NAME_HEADER", "X-Service-Name")
+INTERNAL_AUTH_MODE = os.getenv("INTERNAL_AUTH_MODE", "mtls")
+CALLER_HEADER = "X-Caller-Identity"
 
 
-def _load_trusted_service_tokens() -> dict[str, str]:
-    raw_value = os.getenv("TRUSTED_SERVICE_TOKENS", "{}")
+def validate_internal_auth_mode() -> None:
+    """Статических токенов нет: вызывающего подтверждает сертификат, а имя из него проставляет
+    прокси-сайдкар в X-Caller-Identity (infra/mtls в корне main). Заголовку верим только от
+    loopback, то есть от прокси в том же сетевом пространстве. INTERNAL_AUTH_MODE=insecure
+    отключает проверку и нужен только для локальной отладки без PKI."""
+    if INTERNAL_AUTH_MODE not in ("mtls", "insecure"):
+        raise RuntimeError(f"INTERNAL_AUTH_MODE={INTERNAL_AUTH_MODE!r}: допустимо mtls, insecure")
+    if INTERNAL_AUTH_MODE == "insecure":
+        logger.warning(
+            "INTERNAL_AUTH_MODE=insecure: внутренние вызовы не аутентифицируются. "
+            "Не для стенда и продакшена."
+        )
 
+
+def _is_loopback(host: str | None) -> bool:
     try:
-        parsed = json.loads(raw_value)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("Invalid TRUSTED_SERVICE_TOKENS env value. Expected JSON object.") from exc
-
-    if not isinstance(parsed, dict):
-        raise RuntimeError("TRUSTED_SERVICE_TOKENS must be a JSON object.")
-
-    normalized: dict[str, str] = {}
-    for service_name, token in parsed.items():
-        if service_name is None or token is None:
-            continue
-        normalized[str(service_name)] = str(token)
-
-    return normalized
+        return ipaddress.ip_address(host or "").is_loopback
+    except ValueError:
+        return False
 
 
-# Заглушки из .env.example и слишком короткие значения не годятся в качестве токена:
-# это единственное, что защищает внутренние API.
-WEAK_TOKEN_MARKERS = ("super-secret-token", "change-me", "change_me", "changeme")
-MIN_TOKEN_LENGTH = 24
-
-
-def validate_trusted_service_tokens() -> None:
-    """Останавливает запуск, если в TRUSTED_SERVICE_TOKENS остались предсказуемые токены.
-
-    Токены генерирует scripts/gen_service_tokens.py в корне репозитория main.
-    """
-    weak = [
-        name
-        for name, token in _load_trusted_service_tokens().items()
-        if len(token) < MIN_TOKEN_LENGTH
-        or any(marker in token.lower() for marker in WEAK_TOKEN_MARKERS)
-    ]
-    if weak:
-        raise RuntimeError(
-            f"Слабые токены в TRUSTED_SERVICE_TOKENS для: {', '.join(weak)}. "
-            f"Нужны случайные значения длиной не менее {MIN_TOKEN_LENGTH} символов "
-            "(scripts/gen_service_tokens.py)."
-        )
-
-
-def _extract_internal_header_value(headers: dict[str, str], header_name: str) -> str | None:
-    return headers.get(header_name.lower())
-
-
-async def verify_internal_service_request(
-    x_service_name: str | None = Header(default=None, alias="X-Service-Name"),
-    x_service_token: str | None = Header(default=None, alias="X-Service-Token"),
-):
-    header_values = {
-        INTERNAL_SERVICE_NAME_HEADER.lower(): x_service_name,
-        INTERNAL_AUTH_HEADER_NAME.lower(): x_service_token,
-    }
-
-    service_name = _extract_internal_header_value(header_values, INTERNAL_SERVICE_NAME_HEADER)
-    service_token = _extract_internal_header_value(header_values, INTERNAL_AUTH_HEADER_NAME)
-
-    if not service_name or not service_token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing internal auth headers",
-        )
-
-    trusted_service_tokens = _load_trusted_service_tokens()
-    expected_token = trusted_service_tokens.get(service_name)
-
-    if expected_token is None or not hmac.compare_digest(
-        expected_token.encode(), service_token.encode()
-    ):
-        logger.warning("Internal API forbidden for service=%s", service_name)
+async def verify_internal_service_request(request: Request) -> str:
+    caller = request.headers.get(CALLER_HEADER) or None
+    if INTERNAL_AUTH_MODE == "insecure":
+        return caller or "unauthenticated"
+    peer = request.client.host if request.client else None
+    if not caller or not _is_loopback(peer):
+        logger.warning("Internal API forbidden: caller not verified (peer=%s)", peer)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Forbidden internal service",
         )
-
-    logger.info("Internal API authorized for service=%s", service_name)
-    return service_name
+    logger.info("Internal API authorized for service=%s", caller)
+    return caller
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
