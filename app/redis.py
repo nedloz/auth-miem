@@ -2,20 +2,17 @@ import hashlib
 import json
 from uuid import UUID
 
-import redis.asyncio as redis
 from redis.exceptions import RedisError
 
 from app.config import settings
+from app.redis_tls import make_client
 
 
 # =========================================================
 # REDIS CLIENT
 # =========================================================
 
-redis_client = redis.from_url(
-    settings.REDIS_URL,
-    decode_responses=True,
-)
+redis_client = make_client(settings.REDIS_URL)
 
 
 # =========================================================
