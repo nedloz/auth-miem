@@ -1,9 +1,18 @@
 import asyncio
+import html
+import logging
+import re
 import smtplib
 import ssl
 from email.message import EmailMessage
+from html.parser import HTMLParser
+
+from sqlalchemy import text
 
 from app.config import settings
+from app.database import AsyncSessionLocal
+
+logger = logging.getLogger(__name__)
 
 
 class EmailDeliveryError(RuntimeError):
@@ -13,6 +22,90 @@ class EmailDeliveryError(RuntimeError):
     Выделяем её отдельно, чтобы auth-роуты могли
     отличать проблемы SMTP от обычных ошибок БД.
     """
+
+
+_PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
+_BLOCK_TAGS = {"p", "div", "br", "h1", "h2", "h3", "h4", "li", "tr", "table"}
+
+
+class _HtmlToText(HTMLParser):
+    """Текстовая часть письма из HTML: ссылки остаются видимыми, блоки — отдельными строками."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parts: list[str] = []
+        self._href: str | None = None
+        self._skip = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("style", "script", "title"):
+            self._skip += 1
+        if tag in _BLOCK_TAGS:
+            self.parts.append("\n")
+        if tag == "a":
+            self._href = dict(attrs).get("href")
+
+    def handle_endtag(self, tag):
+        if tag in ("style", "script", "title"):
+            self._skip = max(0, self._skip - 1)
+        if tag in _BLOCK_TAGS:
+            self.parts.append("\n")
+        if tag == "a" and self._href:
+            self.parts.append(f" ({self._href})")
+            self._href = None
+
+    def handle_data(self, data):
+        if not self._skip:
+            self.parts.append(data)
+
+
+def html_to_text(html_body: str) -> str:
+    parser = _HtmlToText()
+    parser.feed(html_body)
+    lines = (re.sub(r"[ \t]+", " ", line).strip() for line in "".join(parser.parts).splitlines())
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip() + "\n"
+
+
+def render_template(template: str, values: dict[str, str], *, escape: bool) -> str:
+    """Подставляет {имя} только из values; прочие фигурные скобки (CSS и т.п.) не трогает."""
+    return _PLACEHOLDER_RE.sub(
+        lambda m: (html.escape(values[m.group(1)], quote=True) if escape else values[m.group(1)])
+        if m.group(1) in values
+        else m.group(0),
+        template,
+    )
+
+
+async def _customized_content(
+    event_type: str,
+    default: tuple[str, str, str],
+    **values: str,
+) -> tuple[str, str, str]:
+    """Текст письма, отредактированный в админке (core.email_templates).
+
+    Любой сбой чтения или пустая строка — не повод не отправить письмо о смене пароля или
+    подтверждении почты, поэтому тогда уходит встроенный текст.
+    """
+    try:
+        async with AsyncSessionLocal() as session:
+            row = (
+                await session.execute(
+                    text(
+                        "SELECT subject_template, body_html FROM core.email_templates "
+                        "WHERE event_type = :event_type"
+                    ),
+                    {"event_type": event_type},
+                )
+            ).first()
+    except Exception:
+        logger.exception("Не удалось прочитать шаблон письма %s, отправляется встроенный текст", event_type)
+        return default
+    if row is None or not (row.subject_template or "").strip() or not (row.body_html or "").strip():
+        return default
+
+    subject = render_template(row.subject_template, values, escape=False)
+    html_body = render_template(row.body_html, values, escape=True)
+    return subject, html_to_text(html_body), html_body
 
 
 def _validate_smtp_settings() -> None:
@@ -206,10 +299,10 @@ async def send_verification_email(
     Отправляет письмо подтверждения.
     """
 
-    subject, text_body, html_body = (
-        _verification_email_content(
-            verification_url
-        )
+    subject, text_body, html_body = await _customized_content(
+        "email_verification",
+        _verification_email_content(verification_url),
+        verification_url=verification_url,
     )
 
     await send_email(
@@ -287,10 +380,10 @@ async def send_password_reset_email(
     Отправляет письмо восстановления пароля.
     """
 
-    subject, text_body, html_body = (
-        _password_reset_email_content(
-            reset_url
-        )
+    subject, text_body, html_body = await _customized_content(
+        "password_reset",
+        _password_reset_email_content(reset_url),
+        reset_url=reset_url,
     )
 
     await send_email(
