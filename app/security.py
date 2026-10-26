@@ -11,6 +11,7 @@ from sqlalchemy.future import select
 from pydantic import ValidationError
 from app.database import get_db
 from app.models import User
+from app import user_context
 import jwt
 
 logger = logging.getLogger(__name__)
@@ -234,25 +235,41 @@ async def get_admin_from_cookie(
 
 # =====================================================================
 # 2. ЭТУ ФУНКЦИЮ ИСПОЛЬЗУЮТ ВСЕ ВНУТРЕННИЕ РОУТЫ (например, профиль)
-# Она просто читает заголовок X-User-Id, который прокинул Nginx.
+# Пользователь берётся из подписанного контекста X-User-Context, который выпустил этот же
+# сервис в /auth/validate и пробросил nginx (app/user_context.py). Голый X-User-Id больше
+# не принимается: его мог выставить любой контейнер в сети.
 # =====================================================================
+def _user_id_from_headers(x_user_context: str | None, x_user_id: str | None) -> str:
+    if x_user_context:
+        try:
+            return user_context.verify_from_env(x_user_context).user_id
+        except user_context.UserContextError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid user context. Unauthorized.",
+            ) from exc
+    # Переходный режим (USER_CONTEXT_ALLOW_LEGACY): старый заголовок от nginx без подписи.
+    if x_user_id and user_context.allow_legacy():
+        return x_user_id
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Missing user context. Unauthorized.",
+    )
+
+
 async def get_current_user(
+    x_user_context: str = Header(None, alias=user_context.HEADER),
     x_user_id: str = Header(None, alias="X-User-Id"),
     db: AsyncSession = Depends(get_db)
 ):
-    # Если заголовка нет — значит запрос пришел в обход Nginx или юзер не авторизован
-    if not x_user_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing X-User-Id header. Unauthorized."
-        )
-        
+    user_id = _user_id_from_headers(x_user_context, x_user_id)
+
     # Просто достаем юзера из базы (чтобы роуты профиля могли с ним работать)
-    stmt = select(User).where(User.id == x_user_id)
+    stmt = select(User).where(User.id == user_id)
     result = await db.execute(stmt)
     user = result.scalars().first()
-    
+
     if user is None or not user.is_active:
         raise HTTPException(status_code=401, detail="User not found or inactive")
-        
+
     return user

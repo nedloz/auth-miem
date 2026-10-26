@@ -1,4 +1,5 @@
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -6,6 +7,7 @@ from sqlalchemy import text
 
 from app.database import engine
 from app.redis import close_redis
+from app import user_context
 from app.security import validate_trusted_service_tokens
 from app.routers import (
     auth,
@@ -38,6 +40,9 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
 
     validate_trusted_service_tokens()
+    # Подпись контекста пользователя нужна каждому запросу через nginx: без ключей сервис не стартует.
+    user_context.check_configuration()
+    user_context.load_keys(os.environ.get("USER_CONTEXT_MASTER_FILE", ""))
 
     logger.info(
         "⏳ Пытаемся подключиться "

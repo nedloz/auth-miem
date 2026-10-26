@@ -1,4 +1,5 @@
 import hashlib
+import os
 import secrets
 from datetime import datetime, timedelta, timezone
 
@@ -7,6 +8,7 @@ from fastapi import (
     Cookie,
     Depends,
     HTTPException,
+    Query,
     Request,
     Response,
     status,
@@ -14,6 +16,7 @@ from fastapi import (
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
+from app import user_context
 from app.config import settings
 from app.database import get_db
 from app.mail import (
@@ -769,23 +772,42 @@ async def logout(
 # 6. VALIDATE (For NGINX)
 # -------------------------------------------------------------------
 
+# Кому auth-svc выписывает контекст пользователя (app/user_context.py). Список задаёт место,
+# где решается маршрутизация, — nginx: аудитория приходит параметром ?aud= из внутренней
+# локации, клиент подставить её не может.
+_ALLOWED_AUDIENCES = {
+    a.strip()
+    for a in os.getenv("USER_CONTEXT_AUDIENCES", "auth-svc,chat-svc,library-svc,db-svc").split(",")
+    if a.strip()
+}
+
+
+def _issue_user_context(user: User, aud: str) -> str:
+    if aud not in _ALLOWED_AUDIENCES:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unknown audience")
+    try:
+        master = user_context.load_keys(os.environ["USER_CONTEXT_MASTER_FILE"])
+        return user_context.sign(master, aud, str(user.id), user.role)
+    except (KeyError, user_context.UserContextError) as exc:
+        # Без ключа подписи пускать запрос нельзя: nginx получит 5xx и закроет доступ.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="User context signing is not configured",
+        ) from exc
+
+
 @router.get(
     "/validate",
     status_code=status.HTTP_200_OK,
 )
 async def validate_token_for_nginx(
     response: Response,
+    aud: str = Query(..., description="сервис, которому предназначен контекст"),
     current_user: User = Depends(
         get_user_from_token
     ),
 ):
-    response.headers["X-User-Id"] = (
-        str(current_user.id)
-    )
-
-    response.headers["X-User-Role"] = (
-        current_user.role
-    )
+    response.headers[user_context.HEADER] = _issue_user_context(current_user, aud)
 
     return {
         "status": "valid"
@@ -863,6 +885,7 @@ async def close_admin_session(
 )
 async def validate_admin_for_nginx(
     response: Response,
+    aud: str = Query("db-svc", description="только админ-панель (db-svc)"),
     current_user: User = Depends(
         get_admin_from_cookie
     ),
@@ -872,13 +895,11 @@ async def validate_admin_for_nginx(
     перед проксированием в db-svc.
     """
 
-    response.headers["X-User-Id"] = (
-        str(current_user.id)
-    )
+    # Админская сессия открывает только админку: контекст другого сервиса по ней не выдаётся.
+    if aud != "db-svc":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unknown audience")
 
-    response.headers["X-User-Role"] = (
-        current_user.role
-    )
+    response.headers[user_context.HEADER] = _issue_user_context(current_user, aud)
 
     return {
         "status": "valid"
