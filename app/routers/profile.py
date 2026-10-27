@@ -349,6 +349,41 @@ async def upload_avatar(
     return updated
 
 
+async def _avatar_response(request: Request, key: str) -> Response:
+    # Имя объекта содержит случайную версию и не меняется: она же служит ETag.
+    etag = f'"{key.rsplit("/", 1)[-1].split(".")[0]}"'
+
+    headers = {
+        "ETag": etag,
+        "Cache-Control": f"private, max-age={AVATAR_CACHE_SECONDS}",
+    }
+
+    if request.headers.get("if-none-match") == etag:
+        return Response(
+            status_code=status.HTTP_304_NOT_MODIFIED,
+            headers=headers,
+        )
+
+    try:
+        stored = await avatar_store.read(key)
+    except avatar_store.AvatarStorageUnavailable:
+        raise _storage_unavailable()
+
+    if stored is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Avatar not found",
+        )
+
+    content, content_type = stored
+
+    return Response(
+        content=content,
+        media_type=content_type,
+        headers=headers,
+    )
+
+
 @router.get("/me/avatar")
 async def get_avatar(
     request: Request,
@@ -367,38 +402,7 @@ async def get_avatar(
             detail="Avatar not found",
         )
 
-    # Имя объекта содержит случайную версию и не меняется: она же служит ETag.
-    etag = f'"{profile.avatar_key.rsplit("/", 1)[-1].split(".")[0]}"'
-
-    headers = {
-        "ETag": etag,
-        "Cache-Control": f"private, max-age={AVATAR_CACHE_SECONDS}",
-    }
-
-    if request.headers.get("if-none-match") == etag:
-        return Response(
-            status_code=status.HTTP_304_NOT_MODIFIED,
-            headers=headers,
-        )
-
-    try:
-        stored = await avatar_store.read(profile.avatar_key)
-    except avatar_store.AvatarStorageUnavailable:
-        raise _storage_unavailable()
-
-    if stored is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Avatar not found",
-        )
-
-    content, content_type = stored
-
-    return Response(
-        content=content,
-        media_type=content_type,
-        headers=headers,
-    )
+    return await _avatar_response(request, profile.avatar_key)
 
 
 @router.delete(

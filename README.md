@@ -92,8 +92,12 @@ SMTP используется для отправки:
 | `GET`    | `/users/me/avatar` | Картинка аватара (ETag, `Cache-Control: private`) |
 | `DELETE` | `/users/me/avatar` | Сбросить аватар |
 
-В ответе профиля есть `email` и `role` (оба только для чтения) и `avatar_url` — путь `GET /users/me/avatar` с
-версией `?v=<версия>`. Картинка лежит в MinIO, бакет `avatars` (`MINIO_AVATARS_BUCKET`), ключ объекта
+Все маршруты профиля и аватара, кроме входа и регистрации, требуют токен: nginx проверяет его через `auth_request`.
+Поэтому `<img>` с `avatar_url` без заголовка `Authorization` не загрузит картинку, её надо забирать через клиент с
+токеном и показывать как blob.
+
+В ответе профиля есть `email` и `role` (оба только для чтения) и `avatar_url` — путь `/api/users/me/avatar?v=<версия>`.
+Картинка лежит в MinIO, бакет `avatars` (`MINIO_AVATARS_BUCKET`), ключ объекта
 `<user_id>/<версия>.<png|jpg|webp>`; ключ хранится в `auth.user_profiles.avatar_key`. При замене и сбросе старый объект
 удаляется. Права auth-svc на бакет заданы в `infra/mtls/minio.conf` (GET, HEAD, PUT, DELETE только на `avatars`, в бакет
 документов он не пускается). Тип определяется по сигнатуре файла, а не по `Content-Type`; если MinIO недоступен, ответ 503.
