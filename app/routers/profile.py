@@ -1,14 +1,22 @@
+import uuid
+
 from fastapi import (
     APIRouter,
     Depends,
+    File,
     HTTPException,
+    Request,
+    Response,
+    UploadFile,
     status,
 )
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
 from app.database import get_db
+from app import avatar_store
 from app.models import User, UserProfile
 from app.redis import (
     get_profile_cache,
@@ -23,6 +31,26 @@ from app.security import get_current_user
 
 
 router = APIRouter()
+
+AVATAR_MAX_BYTES = 5 * 1024 * 1024
+AVATAR_CACHE_SECONDS = 86400
+AVATAR_EXTENSIONS = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/webp": "webp",
+}
+
+
+def _avatar_type(head: bytes) -> str | None:
+    """Тип картинки по сигнатуре: заголовку Content-Type клиента верить нельзя."""
+
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    return None
 
 
 # -------------------------------------------------------------------
@@ -59,6 +87,7 @@ async def get_my_profile(
             cached
         )
         payload.role = current_user.role
+        payload.email = current_user.email
         return payload
 
     stmt = select(UserProfile).where(
@@ -79,6 +108,7 @@ async def get_my_profile(
         profile
     )
     response.role = current_user.role
+    response.email = current_user.email
 
     await set_profile_cache(
         current_user.id,
@@ -133,6 +163,32 @@ async def update_my_profile(
         )
     )
 
+    faculty_id = update_data.get("faculty_id", profile.faculty_id)
+    program_id = update_data.get("program_id", profile.program_id)
+
+    if program_id is not None:
+        program_faculty = (
+            await db.execute(
+                text(
+                    "SELECT faculty_id FROM core.programs "
+                    "WHERE id = CAST(:id AS uuid)"
+                ),
+                {"id": str(program_id)},
+            )
+        ).scalar_one_or_none()
+
+        if program_faculty is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Unknown program_id",
+            )
+
+        if faculty_id is not None and program_faculty != faculty_id:
+            raise HTTPException(
+                status_code=422,
+                detail="program_id does not belong to faculty_id",
+            )
+
     for key, value in update_data.items():
         setattr(
             profile,
@@ -155,6 +211,7 @@ async def update_my_profile(
         profile
     )
     updated.role = current_user.role
+    updated.email = current_user.email
 
     return updated
 
@@ -183,6 +240,190 @@ async def delete_my_account(
     current_user.is_active = False
 
     await db.commit()
+
+    await invalidate_profile_cache(
+        current_user.id
+    )
+
+    return None
+
+
+# -------------------------------------------------------------------
+# AVATAR
+# -------------------------------------------------------------------
+
+def _storage_unavailable() -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail="Avatar storage is unavailable",
+    )
+
+
+async def _get_profile(db: AsyncSession, user: User) -> UserProfile:
+    profile = (
+        await db.execute(
+            select(UserProfile).where(
+                UserProfile.user_id == user.id
+            )
+        )
+    ).scalars().first()
+
+    if not profile:
+        raise HTTPException(
+            status_code=404,
+            detail="Profile not found",
+        )
+
+    return profile
+
+
+@router.post(
+    "/me/avatar",
+    response_model=UserProfileRead,
+)
+async def upload_avatar(
+    file: UploadFile = File(...),
+    current_user: User = Depends(
+        get_current_user
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Загрузить или заменить аватар (png, jpeg, webp, до 5 МБ).
+
+    Картинка лежит в MinIO (бакет avatars), в профиле остаются ключ объекта и
+    путь GET /users/me/avatar с версией, чтобы браузер не держал старую.
+    """
+
+    data = await file.read(AVATAR_MAX_BYTES + 1)
+
+    if len(data) > AVATAR_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="Avatar is larger than 5 MB",
+        )
+
+    content_type = _avatar_type(data[:12])
+
+    if content_type is None:
+        raise HTTPException(
+            status_code=415,
+            detail="Avatar must be png, jpeg or webp",
+        )
+
+    profile = await _get_profile(db, current_user)
+
+    version = uuid.uuid4().hex
+    key = f"{current_user.id}/{version}.{AVATAR_EXTENSIONS[content_type]}"
+    old_key = profile.avatar_key
+
+    try:
+        await avatar_store.put(key, data, content_type)
+    except avatar_store.AvatarStorageUnavailable:
+        raise _storage_unavailable()
+
+    profile.avatar_key = key
+    profile.avatar_url = f"/api/users/me/avatar?v={version}"
+
+    try:
+        await db.commit()
+    except Exception:
+        await avatar_store.remove(key)
+        raise
+
+    await db.refresh(profile)
+
+    if old_key:
+        await avatar_store.remove(old_key)
+
+    await invalidate_profile_cache(
+        current_user.id
+    )
+
+    updated = UserProfileRead.model_validate(
+        profile
+    )
+    updated.role = current_user.role
+    updated.email = current_user.email
+
+    return updated
+
+
+@router.get("/me/avatar")
+async def get_avatar(
+    request: Request,
+    current_user: User = Depends(
+        get_current_user
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+    """Отдать аватар текущего пользователя как картинку."""
+
+    profile = await _get_profile(db, current_user)
+
+    if not profile.avatar_key:
+        raise HTTPException(
+            status_code=404,
+            detail="Avatar not found",
+        )
+
+    # Имя объекта содержит случайную версию и не меняется: она же служит ETag.
+    etag = f'"{profile.avatar_key.rsplit("/", 1)[-1].split(".")[0]}"'
+
+    headers = {
+        "ETag": etag,
+        "Cache-Control": f"private, max-age={AVATAR_CACHE_SECONDS}",
+    }
+
+    if request.headers.get("if-none-match") == etag:
+        return Response(
+            status_code=status.HTTP_304_NOT_MODIFIED,
+            headers=headers,
+        )
+
+    try:
+        stored = await avatar_store.read(profile.avatar_key)
+    except avatar_store.AvatarStorageUnavailable:
+        raise _storage_unavailable()
+
+    if stored is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Avatar not found",
+        )
+
+    content, content_type = stored
+
+    return Response(
+        content=content,
+        media_type=content_type,
+        headers=headers,
+    )
+
+
+@router.delete(
+    "/me/avatar",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_avatar(
+    current_user: User = Depends(
+        get_current_user
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+    """Сбросить аватар к заглушке."""
+
+    profile = await _get_profile(db, current_user)
+
+    old_key = profile.avatar_key
+
+    profile.avatar_key = None
+    profile.avatar_url = None
+
+    await db.commit()
+
+    if old_key:
+        await avatar_store.remove(old_key)
 
     await invalidate_profile_cache(
         current_user.id

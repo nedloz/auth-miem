@@ -41,6 +41,8 @@ class UserProfile(Base):
     year = Column(Integer, nullable=True)
     group_name = Column(String, nullable=True)
     preferences_json = Column(JSONB, nullable=False, default={})
+    avatar_url = Column(String, nullable=True)
+    avatar_key = Column(String, nullable=True)
 
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)

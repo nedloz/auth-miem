@@ -88,6 +88,28 @@ SMTP используется для отправки:
 | `GET`    | `/users/me` | Получить текущий профиль |
 | `PATCH`  | `/users/me` | Изменить профиль         |
 | `DELETE` | `/users/me` | Деактивировать аккаунт   |
+| `POST`   | `/users/me/avatar` | Загрузить аватар (multipart, поле `file`; png, jpeg, webp, до 5 МБ) |
+| `GET`    | `/users/me/avatar` | Картинка аватара (ETag, `Cache-Control: private`) |
+| `DELETE` | `/users/me/avatar` | Сбросить аватар |
+
+В ответе профиля есть `email` и `role` (оба только для чтения) и `avatar_url` — путь `GET /users/me/avatar` с
+версией `?v=<версия>`. Картинка лежит в MinIO, бакет `avatars` (`MINIO_AVATARS_BUCKET`), ключ объекта
+`<user_id>/<версия>.<png|jpg|webp>`; ключ хранится в `auth.user_profiles.avatar_key`. При замене и сбросе старый объект
+удаляется. Права auth-svc на бакет заданы в `infra/mtls/minio.conf` (GET, HEAD, PUT, DELETE только на `avatars`, в бакет
+документов он не пускается). Тип определяется по сигнатуре файла, а не по `Content-Type`; если MinIO недоступен, ответ 503.
+Группа (`group_name`) — свободная строка: пробелы схлопываются, пустая становится `null`, не длиннее 32
+символов; справочника групп нет. `PATCH` проверяет, что `program_id` существует и относится к `faculty_id`.
+
+## Справочники
+
+Для выпадающих списков профиля, с авторизацией как у `/users/me`. Читаются из схемы `core` (роль `core_ro`).
+
+| Метод | Endpoint | Назначение |
+| ----- | -------- | ---------- |
+| `GET` | `/core/faculties[?university_id=]` | Факультеты по алфавиту: `id, name, short_name` |
+| `GET` | `/core/programs[?faculty_id=]` | Действующие направления: `id, name, short_name, code, degree_level` |
+
+Снаружи — `/api/core/...` (отдельная локация в nginx и правило в `infra/mtls/auth-svc.conf`).
 
 ## Internal API
 

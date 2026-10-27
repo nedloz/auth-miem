@@ -14,6 +14,7 @@ from app.routers import (
     auth,
     internal,
     profile,
+    reference,
 )
 
 
@@ -121,6 +122,12 @@ app.include_router(
     profile.router,
     prefix="/users",
     tags=["Profile"],
+)
+
+app.include_router(
+    reference.router,
+    prefix="/core",
+    tags=["Reference"],
 )
 
 app.include_router(
