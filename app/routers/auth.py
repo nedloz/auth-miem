@@ -17,6 +17,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
 from app import user_context
+from app.metrics import (
+    ADMIN_SESSIONS,
+    LOGINS,
+    REGISTRATIONS,
+    TOKEN_REFRESH,
+)
 from app.config import settings
 from app.database import get_db
 from app.mail import (
@@ -274,6 +280,7 @@ async def register_user(
 
     await db.commit()
     await db.refresh(new_user)
+    REGISTRATIONS.inc()
 
     await cache_one_time_token(
         "verify",
@@ -516,18 +523,21 @@ async def login(
         user_in.password,
         user.password_hash,
     ):
+        LOGINS.labels(result="invalid_credentials").inc()
         raise HTTPException(
             status_code=401,
             detail="Invalid credentials",
         )
 
     if not user.is_active:
+        LOGINS.labels(result="deactivated").inc()
         raise HTTPException(
             status_code=403,
             detail="User is deactivated",
         )
 
     if not user.is_email_verified:
+        LOGINS.labels(result="email_not_verified").inc()
         raise HTTPException(
             status_code=403,
             detail="Email not verified",
@@ -580,6 +590,7 @@ async def login(
         ),
     )
 
+    LOGINS.labels(result="success").inc()
     return {
         "access_token": access_token,
         "token_type": "bearer",
@@ -603,6 +614,7 @@ async def refresh_tokens(
     db: AsyncSession = Depends(get_db),
 ):
     if not refresh_token:
+        TOKEN_REFRESH.labels(result="missing").inc()
         raise HTTPException(
             status_code=401,
             detail="Refresh token missing",
@@ -623,12 +635,14 @@ async def refresh_tokens(
     db_token = result.scalars().first()
 
     if not db_token:
+        TOKEN_REFRESH.labels(result="invalid").inc()
         raise HTTPException(
             status_code=401,
             detail="Invalid refresh token",
         )
 
     if db_token.revoked_at is not None:
+        TOKEN_REFRESH.labels(result="revoked").inc()
         raise HTTPException(
             status_code=401,
             detail=(
@@ -647,6 +661,7 @@ async def refresh_tokens(
 
         await db.commit()
 
+        TOKEN_REFRESH.labels(result="expired").inc()
         raise HTTPException(
             status_code=401,
             detail="Refresh token expired",
@@ -661,6 +676,7 @@ async def refresh_tokens(
     ).scalars().first()
 
     if not user or not user.is_active:
+        TOKEN_REFRESH.labels(result="user_inactive").inc()
         raise HTTPException(
             status_code=401,
             detail=(
@@ -712,6 +728,7 @@ async def refresh_tokens(
         ),
     )
 
+    TOKEN_REFRESH.labels(result="success").inc()
     return {
         "access_token": new_access_token,
         "token_type": "bearer",
@@ -853,6 +870,7 @@ async def open_admin_session(
         ),
     )
 
+    ADMIN_SESSIONS.inc()
     return {
         "status": "ok",
         "expires_in": (

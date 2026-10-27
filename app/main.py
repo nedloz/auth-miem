@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from sqlalchemy import text
 
+from app.metrics import setup_metrics
 from app.database import engine
 from app.redis import close_redis
 from app import user_context
@@ -103,6 +104,7 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+setup_metrics(app)
 
 
 # =========================================================

@@ -713,3 +713,16 @@ nginx пробрасывает его вместо заголовков, а се
 (`USER_CONTEXT_ALLOW_LEGACY=true`) только на время перехода. Ключи: `main/scripts/gen_user_context_keys.py`,
 проверка: `main/infra/nginx/tests/user_context_e2e.sh`. Упоминания `X-User-Id` в этом файле выше
 описывают прежнюю схему.
+
+## Метрики
+
+`GET /metrics` отдаёт Prometheus (за mTLS - только пользователю `prometheus`, политика в `infra/mtls/auth-svc.conf`). Кроме HTTP-метрик (`http_requests_total`, `http_request_duration_seconds`, `http_requests_inprogress`; метка `handler` - шаблон маршрута) сервис отдаёт бизнес-метрики с префиксом `pochemuchnik_`. Код: `app/metrics.py`, тесты: `tests/`. Общая картина и дашборды - `infra/observability/README.md` в корневом репозитории.
+
+| Метрика | Что считает |
+| :-- | :-- |
+| `registrations_total` | созданные учётные записи |
+| `logins_total{result}` | попытки входа: `success`, `invalid_credentials`, `deactivated`, `email_not_verified` |
+| `token_refresh_total{result}` | обновления токена: `success`, `missing`, `invalid`, `revoked`, `expired`, `user_inactive` |
+| `emails_sent_total{kind,result}` | письма: `kind` - `verification`, `password_reset`; `result` - `sent`, `failed` |
+| `admin_sessions_total` | открытые админ-сессии |
+

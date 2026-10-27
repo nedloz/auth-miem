@@ -9,6 +9,7 @@ from html.parser import HTMLParser
 
 from sqlalchemy import text
 
+from app.metrics import EMAILS_SENT
 from app.config import settings
 from app.database import AsyncSessionLocal
 
@@ -215,18 +216,27 @@ async def send_email(
     subject: str,
     text_body: str,
     html_body: str | None = None,
+    *,
+    kind: str = "other",
 ) -> None:
     """
     Запускаем синхронный smtplib вне event loop.
+
+    kind попадает в метрику отправленных писем (verification, password_reset).
     """
 
-    await asyncio.to_thread(
-        _send_email_sync,
-        recipient,
-        subject,
-        text_body,
-        html_body,
-    )
+    try:
+        await asyncio.to_thread(
+            _send_email_sync,
+            recipient,
+            subject,
+            text_body,
+            html_body,
+        )
+    except Exception:
+        EMAILS_SENT.labels(kind=kind, result="failed").inc()
+        raise
+    EMAILS_SENT.labels(kind=kind, result="sent").inc()
 
 
 def _verification_email_content(
@@ -310,6 +320,7 @@ async def send_verification_email(
         subject=subject,
         text_body=text_body,
         html_body=html_body,
+        kind="verification",
     )
 
 
@@ -391,4 +402,5 @@ async def send_password_reset_email(
         subject=subject,
         text_body=text_body,
         html_body=html_body,
+        kind="password_reset",
     )
