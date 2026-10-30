@@ -1,4 +1,3 @@
-import hashlib
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -13,6 +12,7 @@ from fastapi import (
     Response,
     status,
 )
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
@@ -28,10 +28,8 @@ from app.database import get_db
 from app.mail import (
     EmailDeliveryError,
     send_password_reset_email,
-    send_verification_email,
 )
 from app.models import (
-    EmailVerification,
     PasswordReset,
     RefreshToken,
     User,
@@ -64,6 +62,12 @@ from app.security import (
     get_user_from_token,
     verify_password,
 )
+from app.verification import (
+    build_frontend_url,
+    confirm_email,
+    hash_token,
+    request_email_verification,
+)
 
 
 router = APIRouter()
@@ -72,36 +76,6 @@ router = APIRouter()
 # =========================================================
 # HELPERS
 # =========================================================
-
-def hash_token(token: str) -> str:
-    """
-    В БД и Redis сохраняем только SHA-256 hash.
-    """
-
-    return hashlib.sha256(
-        token.encode()
-    ).hexdigest()
-
-
-def build_frontend_url(
-    path: str,
-    token: str,
-) -> str:
-    """
-    Формируем публичную frontend-ссылку.
-    """
-
-    base_url = (
-        settings.FRONTEND_BASE_URL
-        .rstrip("/")
-    )
-
-    return (
-        f"{base_url}"
-        f"/{path.lstrip('/')}"
-        f"?token={token}"
-    )
-
 
 def is_token_expired(
     created_at: datetime,
@@ -171,73 +145,10 @@ async def register_user(
 
     existing_user = result.scalars().first()
 
-    # =========================================================
-    # EMAIL ALREADY EXISTS
-    # =========================================================
-
+    # Повторная регистрация не должна менять пароль владельца аккаунта.
+    # Новую ссылку можно запросить через /resend-verification.
     if existing_user:
-
-        if existing_user.is_email_verified:
-            raise HTTPException(
-                status_code=400,
-                detail="Email already registered",
-            )
-
-        existing_user.password_hash = (
-            get_password_hash(
-                user_in.password
-            )
-        )
-
-        raw_verify_token = (
-            secrets.token_urlsafe(32)
-        )
-
-        verify_hash = hash_token(
-            raw_verify_token
-        )
-
-        verify_record = EmailVerification(
-            user_id=existing_user.id,
-            email=existing_user.email,
-            token_hash=verify_hash,
-        )
-
-        db.add(verify_record)
-
-        await db.commit()
-        await db.refresh(existing_user)
-
-        # Redis хранит hash токена с тем же TTL,
-        # что задан в конфигурации.
-        await cache_one_time_token(
-            "verify",
-            verify_hash,
-            existing_user.id,
-            settings.EMAIL_VERIFY_TOKEN_EXPIRE_MINUTES * 60,
-        )
-
-        verification_url = build_frontend_url(
-            "/verify-email",
-            raw_verify_token,
-        )
-
-        try:
-            await send_verification_email(
-                existing_user.email,
-                verification_url,
-            )
-
-        except EmailDeliveryError as exc:
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "Verification email "
-                    "could not be sent"
-                ),
-            ) from exc
-
-        return existing_user
+        raise HTTPException(status_code=400, detail="Email already registered")
 
     # =========================================================
     # NEW USER
@@ -253,61 +164,26 @@ async def register_user(
     )
 
     db.add(new_user)
+    try:
+        await db.flush()
+        db.add(UserProfile(user_id=new_user.id))
+        await db.commit()
+    except IntegrityError as exc:
+        # Два одновременных запроса регистрации одной почты: один создаёт аккаунт,
+        # второй получает тот же ответ, что и при обычной повторной регистрации.
+        await db.rollback()
+        duplicate = await db.execute(select(User.id).where(User.email == user_in.email))
+        if duplicate.scalar_one_or_none() is None:
+            raise
+        raise HTTPException(status_code=400, detail="Email already registered") from exc
 
-    await db.flush()
-
-    new_profile = UserProfile(
-        user_id=new_user.id
-    )
-
-    db.add(new_profile)
-
-    raw_verify_token = (
-        secrets.token_urlsafe(32)
-    )
-
-    verify_hash = hash_token(
-        raw_verify_token
-    )
-
-    verify_record = EmailVerification(
-        user_id=new_user.id,
-        email=new_user.email,
-        token_hash=verify_hash,
-    )
-
-    db.add(verify_record)
-
-    await db.commit()
     await db.refresh(new_user)
     REGISTRATIONS.inc()
-
-    await cache_one_time_token(
-        "verify",
-        verify_hash,
+    await request_email_verification(
+        db,
         new_user.id,
-        settings.EMAIL_VERIFY_TOKEN_EXPIRE_MINUTES * 60,
+        delivery_error_detail="Account created, but verification email could not be sent",
     )
-
-    verification_url = build_frontend_url(
-        "/verify-email",
-        raw_verify_token,
-    )
-
-    try:
-        await send_verification_email(
-            new_user.email,
-            verification_url,
-        )
-
-    except EmailDeliveryError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Account created, but "
-                "verification email could not be sent"
-            ),
-        ) from exc
 
     return new_user
 
@@ -332,58 +208,8 @@ async def resend_verification(
 
     user = result.scalars().first()
 
-    if not user or user.is_email_verified:
-        return {
-            "detail": (
-                "If the account exists and is unverified, "
-                "a new link has been sent."
-            )
-        }
-
-    raw_verify_token = (
-        secrets.token_urlsafe(32)
-    )
-
-    verify_hash = hash_token(
-        raw_verify_token
-    )
-
-    verify_record = EmailVerification(
-        user_id=user.id,
-        email=user.email,
-        token_hash=verify_hash,
-    )
-
-    db.add(verify_record)
-
-    await db.commit()
-
-    await cache_one_time_token(
-        "verify",
-        verify_hash,
-        user.id,
-        settings.EMAIL_VERIFY_TOKEN_EXPIRE_MINUTES * 60,
-    )
-
-    verification_url = build_frontend_url(
-        "/verify-email",
-        raw_verify_token,
-    )
-
-    try:
-        await send_verification_email(
-            user.email,
-            verification_url,
-        )
-
-    except EmailDeliveryError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Verification email "
-                "could not be sent"
-            ),
-        ) from exc
+    if user is not None:
+        await request_email_verification(db, user.id)
 
     return {
         "detail": (
@@ -399,102 +225,11 @@ async def resend_verification(
 
 @router.get("/verify-email")
 async def verify_email(
-    token: str,
+    token: str = Query(..., min_length=1, max_length=256),
     db: AsyncSession = Depends(get_db),
 ):
-    t_hash = hash_token(token)
-
-    # Сначала используем Redis как быстрый TTL/cache слой.
-    cached_user_id = await get_cached_one_time_token(
-        "verify",
-        t_hash,
-    )
-
-    if cached_user_id is None:
-
-        # Redis miss:
-        # PostgreSQL остаётся источником истины.
-        stmt = select(
-            EmailVerification
-        ).where(
-            EmailVerification.token_hash == t_hash,
-            EmailVerification.used_at == None,
-        )
-
-    else:
-
-        stmt = select(
-            EmailVerification
-        ).where(
-            EmailVerification.token_hash == t_hash,
-            EmailVerification.user_id == cached_user_id,
-            EmailVerification.used_at == None,
-        )
-
-    result = await db.execute(stmt)
-
-    ver_record = result.scalars().first()
-
-    if not ver_record:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid or expired token",
-        )
-
-    # Даже при наличии Redis проверяем реальный TTL.
-    if is_token_expired(
-        ver_record.created_at,
-        settings.EMAIL_VERIFY_TOKEN_EXPIRE_MINUTES,
-    ):
-        await delete_cached_one_time_token(
-            "verify",
-            t_hash,
-        )
-
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid or expired token",
-        )
-
-    # Если Redis потерял ключ раньше DB TTL,
-    # восстанавливаем cache на оставшееся время.
-    if cached_user_id is None:
-        await cache_one_time_token(
-            "verify",
-            t_hash,
-            ver_record.user_id,
-            remaining_ttl_seconds(
-                ver_record.created_at,
-                settings.EMAIL_VERIFY_TOKEN_EXPIRE_MINUTES,
-            ),
-        )
-
-    stmt_u = select(User).where(
-        User.id == ver_record.user_id
-    )
-
-    user = (
-        await db.execute(stmt_u)
-    ).scalars().first()
-
-    if user:
-        user.is_email_verified = True
-
-    ver_record.used_at = (
-        datetime.now(timezone.utc)
-    )
-
-    await db.commit()
-
-    # Verification token одноразовый.
-    await delete_cached_one_time_token(
-        "verify",
-        t_hash,
-    )
-
-    return {
-        "msg": "Email successfully verified"
-    }
+    await confirm_email(db, token)
+    return {"msg": "Email successfully verified"}
 
 
 # -------------------------------------------------------------------

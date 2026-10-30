@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr, UUID4, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, UUID4, field_validator
 from typing import Optional, Any
 from datetime import datetime
 
@@ -89,6 +89,12 @@ class ResetPassword(BaseModel):
 
 class ResendVerification(BaseModel):
     email: EmailStr
+
+
+class InternalEmailVerificationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: UUID4
 
 
 class InternalUserProfilePayload(BaseModel):

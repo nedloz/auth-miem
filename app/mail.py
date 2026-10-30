@@ -27,6 +27,18 @@ class EmailDeliveryError(RuntimeError):
 
 _PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
 _BLOCK_TAGS = {"p", "div", "br", "h1", "h2", "h3", "h4", "li", "tr", "table"}
+_ACTION_URLS = {"email_verification": "verification_url", "password_reset": "reset_url"}
+
+
+class _ActionLinkParser(HTMLParser):
+    def __init__(self, url: str) -> None:
+        super().__init__()
+        self.url = url
+        self.found = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a" and dict(attrs).get("href") == self.url:
+            self.found = True
 
 
 class _HtmlToText(HTMLParser):
@@ -106,6 +118,21 @@ async def _customized_content(
 
     subject = render_template(row.subject_template, values, escape=False)
     html_body = render_template(row.body_html, values, escape=True)
+    unknown = (
+        set(_PLACEHOLDER_RE.findall(row.subject_template + row.body_html))
+        - values.keys()
+    )
+    action_variable = _ACTION_URLS.get(event_type)
+    valid_link = True
+    if action_variable is not None:
+        parser = _ActionLinkParser(values[action_variable])
+        parser.feed(html_body)
+        valid_link = parser.found
+    if unknown or "\r" in subject or "\n" in subject or not valid_link:
+        # Не отправляем письмо с опечаткой в переменной, без кнопки действия или
+        # с переносом строки в теме. Не логируем содержимое письма и секретную ссылку.
+        logger.warning("Некорректный шаблон %s, отправляется встроенный текст", event_type)
+        return default
     return subject, html_to_text(html_body), html_body
 
 

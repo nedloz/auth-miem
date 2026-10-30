@@ -18,17 +18,33 @@ from app.redis import (
     set_profile_cache,
 )
 from app.schemas import (
+    InternalEmailVerificationRequest,
     InternalUserProfilePayload,
     InternalUserProfileResponse,
 )
 from app.security import (
     verify_internal_service_request,
 )
+from app.verification import request_email_verification
 
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+@router.post("/notifications/email-verification")
+async def send_internal_email_verification(
+    data: InternalEmailVerificationRequest,
+    caller: str = Depends(verify_internal_service_request),
+    db: AsyncSession = Depends(get_db),
+):
+    # Только административный сервис может запрашивать повторное письмо.
+    # Получатель и ссылка берутся из auth, а не из произвольных полей запроса.
+    if caller != "db-svc":
+        raise HTTPException(status_code=403, detail="Forbidden internal service")
+    result = await request_email_verification(db, data.user_id)
+    return {"status": result}
 
 
 @router.get(

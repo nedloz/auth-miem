@@ -1,3 +1,6 @@
+from urllib.parse import urlsplit
+
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -27,7 +30,9 @@ class Settings(BaseSettings):
     REFRESH_TOKEN_EXPIRE_MINUTES: int = 43200
 
     # Email verification token: 24 часа
-    EMAIL_VERIFY_TOKEN_EXPIRE_MINUTES: int = 1440
+    EMAIL_VERIFY_TOKEN_EXPIRE_MINUTES: int = Field(default=1440, gt=0)
+
+    EMAIL_VERIFY_RESEND_COOLDOWN_SECONDS: int = Field(default=60, ge=0)
 
     # Password reset token: 1 час
     PASSWORD_RESET_TOKEN_EXPIRE_MINUTES: int = 60
@@ -38,6 +43,22 @@ class Settings(BaseSettings):
 
     # Публичный URL frontend/nginx.
     FRONTEND_BASE_URL: str = "http://localhost"
+
+    @field_validator("FRONTEND_BASE_URL")
+    @classmethod
+    def validate_frontend_url(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or any(char.isspace() for char in value)
+        ):
+            raise ValueError("FRONTEND_BASE_URL must be an http(s) URL without credentials, query or fragment")
+        return value.rstrip("/")
 
     # =========================================================
     # SMTP
